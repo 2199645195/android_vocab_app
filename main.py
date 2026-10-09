@@ -16,13 +16,13 @@ from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner, SpinnerOption
+from kivy.uix.textinput import TextInput
 
 
 # =========================
 # 中文字体支持
 # =========================
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-
 FONT_CANDIDATES = [
     os.path.join(APP_DIR, "fonts", "NotoSansSC-VariableFont_wght.ttf"),
     "/system/fonts/NotoSansCJK-Regular.ttc",
@@ -196,7 +196,7 @@ class VocabTrainer(BoxLayout):
     is_answering = BooleanProperty(False)
 
     def __init__(self, **kwargs):
-        super().__init__(orientation="vertical", spacing=dp(10), padding=dp(14), **kwargs)
+        super().__init__(orientation="vertical", spacing=dp(10), padding=[dp(14), dp(58), dp(14), dp(18)], **kwargs)
         Window.clearcolor = (0.96, 0.97, 0.98, 1)
         self.units = {}
         self.selected_unit = "Unit 6"
@@ -210,15 +210,40 @@ class VocabTrainer(BoxLayout):
         self.progress_path = os.path.join(self.data_dir, "progress.json")
         self.wrong_path = os.path.join(self.data_dir, "wrong_words.jsonl")
         self.stats_path = os.path.join(self.data_dir, "stats.json")
+        self.custom_units_path = os.path.join(self.data_dir, "custom_units.json")
         self.load_vocab()
         self.build_menu()
 
     def load_vocab(self):
         app_dir = os.path.dirname(os.path.abspath(__file__))
         vocab_path = os.path.join(app_dir, "data", "vocab.txt")
-        self.units = parse_vocab_file(vocab_path)
+
+        builtin_units = parse_vocab_file(vocab_path) if os.path.exists(vocab_path) else {}
+        custom_units = self.load_json(self.custom_units_path, {}) if hasattr(self, "custom_units_path") else {}
+
+        self.units = {name: list(words) for name, words in builtin_units.items()}
+        for unit_name, words in custom_units.items():
+            if not isinstance(words, list):
+                continue
+            self.units.setdefault(unit_name, [])
+            existing = {item.get("en", "").lower() for item in self.units[unit_name]}
+            for item in words:
+                if not isinstance(item, dict) or not item.get("en") or not item.get("zh"):
+                    continue
+                if item.get("en", "").lower() not in existing:
+                    self.units[unit_name].append(item)
+                    existing.add(item.get("en", "").lower())
+
         if self.units:
-            self.selected_unit = sorted(self.units, key=lambda item: int(re.search(r"\d+", item).group()))[0]
+            names = self.sorted_unit_names()
+            if self.selected_unit not in self.units:
+                self.selected_unit = names[0]
+
+    def sorted_unit_names(self):
+        def sort_key(name):
+            match = re.search(r"\d+", name)
+            return (0, int(match.group())) if match else (1, name.lower())
+        return sorted(self.units, key=sort_key)
 
     def clear(self):
         self.clear_widgets()
@@ -235,7 +260,7 @@ class VocabTrainer(BoxLayout):
         )
         self.add_widget(title)
 
-        unit_names = sorted(self.units, key=lambda item: int(re.search(r"\d+", item).group()))
+        unit_names = self.sorted_unit_names()
         self.unit_spinner = CNSpinner(
             text=self.selected_unit,
             values=unit_names,
@@ -245,6 +270,16 @@ class VocabTrainer(BoxLayout):
         )
         self.unit_spinner.bind(text=self.set_unit)
         self.add_widget(self.unit_spinner)
+
+        add_unit_button = CNButton(
+            text="＋ 添加单元 / 单词",
+            font_size=dp(17),
+            size_hint_y=None,
+            height=dp(44),
+            background_color=(0.20, 0.38, 0.62, 1),
+        )
+        add_unit_button.bind(on_release=self.show_add_unit_popup)
+        self.add_widget(add_unit_button)
 
         self.mode_spinner = CNSpinner(
             text="单词听音四选一",
@@ -302,6 +337,104 @@ class VocabTrainer(BoxLayout):
     def set_unit(self, _spinner, value):
         self.selected_unit = value
         self.build_menu()
+
+    def show_add_unit_popup(self, *_):
+        content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
+
+        tip = CNLabel(
+            text="输入单元编号和单词。\n单词格式：英文 | 词性 | 中文释义 | 关联词(可选)",
+            size_hint_y=None,
+            height=dp(70),
+            halign="left",
+            valign="middle",
+            color=(0.12, 0.16, 0.22, 1),
+        )
+        tip.bind(size=lambda label, size: setattr(label, "text_size", size))
+        content.add_widget(tip)
+
+        unit_input = TextInput(
+            hint_text="例如：7 或 Unit 7",
+            multiline=False,
+            size_hint_y=None,
+            height=dp(46),
+        )
+        if CHINESE_FONT_PATH:
+            unit_input.font_name = CHINESE_FONT_NAME
+        content.add_widget(unit_input)
+
+        words_input = TextInput(
+            hint_text="ability | n. | 能力\naccept | v. | 接受\nactive | adj. | 积极的",
+            multiline=True,
+        )
+        if CHINESE_FONT_PATH:
+            words_input.font_name = CHINESE_FONT_NAME
+        content.add_widget(words_input)
+
+        button_row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        cancel_button = CNButton(text="取消")
+        save_button = CNButton(text="保存", background_color=(0.12, 0.62, 0.36, 1))
+        button_row.add_widget(cancel_button)
+        button_row.add_widget(save_button)
+        content.add_widget(button_row)
+
+        popup_kwargs = {
+            "title": "添加单元 / 单词",
+            "content": content,
+            "size_hint": (0.92, 0.78),
+        }
+        if CHINESE_FONT_PATH:
+            popup_kwargs["title_font"] = CHINESE_FONT_NAME
+        popup = Popup(**popup_kwargs)
+
+        cancel_button.bind(on_release=popup.dismiss)
+        save_button.bind(on_release=lambda *_: self.save_custom_unit(unit_input.text, words_input.text, popup))
+        popup.open()
+
+    def save_custom_unit(self, unit_text, words_text, popup):
+        unit_text = (unit_text or "").strip()
+        number_match = re.search(r"\d+", unit_text)
+        if not number_match:
+            self.show_popup("提示", "请输入单元编号，例如 7 或 Unit 7。")
+            return
+
+        unit_name = f"Unit {int(number_match.group())}"
+        parsed_words = []
+        invalid_lines = []
+        for raw in (words_text or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            item = parse_word_line(line)
+            if item:
+                parsed_words.append(item)
+            else:
+                invalid_lines.append(line)
+
+        if not parsed_words:
+            self.show_popup("提示", "没有识别到有效单词。\n请按：英文 | 词性 | 中文释义")
+            return
+
+        custom_units = self.load_json(self.custom_units_path, {})
+        custom_units.setdefault(unit_name, [])
+        existing = {item.get("en", "").lower() for item in custom_units[unit_name] if isinstance(item, dict)}
+        added = 0
+        for item in parsed_words:
+            key = item["en"].lower()
+            if key not in existing:
+                custom_units[unit_name].append(item)
+                existing.add(key)
+                added += 1
+
+        self.save_json(self.custom_units_path, custom_units)
+        self.selected_unit = unit_name
+        self.load_vocab()
+        popup.dismiss()
+        self.build_menu()
+
+        message = f"{unit_name} 已保存，新增 {added} 个单词。"
+        if invalid_lines:
+            message += f"\n有 {len(invalid_lines)} 行格式无法识别，已跳过。"
+        self.show_popup("保存成功", message)
 
     def make_progress_key(self, unit, mode):
         return f"builtin_vocab|{unit}|{mode}"
