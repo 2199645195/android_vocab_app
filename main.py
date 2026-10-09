@@ -175,7 +175,7 @@ def parse_vocab_file(path):
 
 
 class CachedWordAudio:
-    """Free Dictionary API 单词真人音频：后台下载、私有目录缓存、Android MediaPlayer 播放。"""
+    """有道在线发音：后台下载、私有目录缓存、Android MediaPlayer 播放。"""
 
     def __init__(self, cache_dir, on_error=None):
         self.cache_dir = cache_dir
@@ -254,60 +254,62 @@ class CachedWordAudio:
             self._notify_error("下载成功，但当前设备无法播放 MP3 音频。", generation)
 
     def _download(self, word, path, generation):
+        """优先有道英式/美式发音：后台尝试、校验 MP3 并原子缓存。"""
         temp_path = None
         try:
-            api = "https://api.dictionaryapi.dev/api/v2/entries/en/" + urllib.parse.quote(word, safe="")
-            request = urllib.request.Request(api, headers={"User-Agent": "VocabTrainer/1.0"})
-            with urllib.request.urlopen(request, timeout=10) as response:
-                data = response.read(256 * 1024 + 1)
-            if len(data) > 256 * 1024:
-                raise ValueError("词典响应太大")
-            entries = json.loads(data.decode("utf-8"))
-            urls = []
-            for entry in entries if isinstance(entries, list) else []:
-                for phonetic in entry.get("phonetics", []):
-                    url = phonetic.get("audio", "")
-                    if url:
-                        if url.startswith("//"):
-                            url = "https:" + url
-                        urls.append(url)
-            # Android MediaPlayer 优先使用 MP3（词典也可能提供 OGG）。
-            urls.sort(key=lambda x: (".mp3" not in urllib.parse.urlparse(x).path.lower(), x))
-            audio_url = None
+            # type=2 美音，type=1 英音。下载与缓存不依赖 Android TTS。
+            urls = [
+                "https://dict.youdao.com/dictvoice?" + urllib.parse.urlencode({"audio": word, "type": kind})
+                for kind in ("2", "1")
+            ]
+            errors = []
+            content = None
             for url in urls:
-                parsed = urllib.parse.urlparse(url)
-                if parsed.scheme != "https" or parsed.hostname not in (
-                    "ssl.gstatic.com", "upload.wikimedia.org", "commons.wikimedia.org"
-                ):
-                    continue
-                if parsed.path.lower().endswith(".mp3"):
-                    audio_url = url
+                if self._closed:
+                    return
+                try:
+                    request = urllib.request.Request(
+                        url,
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36",
+                            "Accept": "audio/mpeg,audio/*;q=0.9,*/*;q=0.5",
+                            "Referer": "https://dict.youdao.com/",
+                        },
+                    )
+                    with urllib.request.urlopen(request, timeout=12) as response:
+                        content_type = response.headers.get("Content-Type", "").lower()
+                        candidate = response.read(2 * 1024 * 1024 + 1)
+                    if not (100 <= len(candidate) <= 2 * 1024 * 1024):
+                        raise ValueError("音频长度不合理")
+                    # 有道 dictvoice 通常返回 MPEG audio；防止 HTML 错误页进入缓存。
+                    is_mp3 = (candidate.startswith(b"ID3") or
+                              (candidate[0] == 0xff and (candidate[1] & 0xe0) == 0xe0))
+                    if not is_mp3:
+                        raise ValueError("服务器未返回 MP3" + (" (" + content_type[:32] + ")" if content_type else ""))
+                    content = candidate
                     break
-            if not audio_url:
-                raise LookupError("该单词暂无可用的 MP3 发音")
-            request = urllib.request.Request(audio_url, headers={"User-Agent": "VocabTrainer/1.0"})
-            with urllib.request.urlopen(request, timeout=15) as response:
-                content = response.read(2 * 1024 * 1024 + 1)
-            if len(content) > 2 * 1024 * 1024 or len(content) < 100:
-                raise ValueError("音频大小异常")
-            # MP3 可包含 ID3 tag 或以 MPEG frame 开头。
-            if not (content.startswith(b"ID3") or (content[0] == 0xff and (content[1] & 0xe0) == 0xe0)):
-                raise ValueError("下载内容不是 MP3")
+                except HTTPError as exc:
+                    errors.append(f"HTTP {exc.code}")
+                except (URLError, TimeoutError, OSError) as exc:
+                    errors.append("网络连接异常：" + type(exc).__name__)
+                except ValueError as exc:
+                    errors.append(str(exc))
+
+            if content is None:
+                raise RuntimeError("有道发音下载失败（" + "；".join(errors[:2]) + "）")
+            if self._closed:
+                return
             temp_path = path + "." + str(generation) + ".tmp"
-            with open(temp_path, "wb") as f:
-                f.write(content)
+            with open(temp_path, "wb") as output:
+                output.write(content)
             with self._lock:
                 os.replace(temp_path, path)
             temp_path = None
             Clock.schedule_once(lambda _dt: self._play(path, generation), 0)
-        except (HTTPError, URLError, TimeoutError, OSError, ValueError, LookupError, json.JSONDecodeError) as exc:
-            if isinstance(exc, (HTTPError, LookupError)) and (isinstance(exc, LookupError) or getattr(exc, "code", 0) == 404):
-                msg = "词典暂未提供该单词的可用 MP3 发音。"
-            else:
-                msg = "音频下载失败，请检查网络后点“再听一次”。"
-            self._notify_error(msg, generation)
-        except Exception:
-            self._notify_error("发音暂不可用，请稍后重试。", generation)
+        except (ConnectionError, RuntimeError, ValueError, LookupError, OSError) as exc:
+            self._notify_error("发音失败：" + str(exc)[:160], generation)
+        except Exception as exc:
+            self._notify_error("发音异常：" + type(exc).__name__ + "（请反馈此信息）", generation)
         finally:
             if temp_path:
                 try:
