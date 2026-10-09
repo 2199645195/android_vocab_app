@@ -185,7 +185,7 @@ def parse_vocab_file(path):
 
 
 class AndroidTTS:
-    def __init__(self, on_missing_voice=None):
+    def __init__(self, on_tts_unavailable=None):
         self.ready = False
         self.initializing = False
         self.tts = None
@@ -194,8 +194,8 @@ class AndroidTTS:
         self.error_message = ""
         self.TextToSpeech = None
         self.Locale = None
-        self.on_missing_voice = on_missing_voice
-        self.missing_english_voice = False
+        self.on_tts_unavailable = on_tts_unavailable
+        self.tts_unavailable = False
 
         if platform != "android":
             self.error_message = "当前不是 Android 环境，未启用系统 TTS。"
@@ -228,21 +228,26 @@ class AndroidTTS:
                 return
 
             if int(status) != int(self.TextToSpeech.SUCCESS):
-                self.error_message = f"Android TTS 初始化失败，状态码：{status}"
+                self.error_message = (
+                    f"Android TTS 初始化失败，状态码：{status}。"
+                    "可能是手机没有可用的 TTS 引擎或语音数据。"
+                )
                 self.ready = False
+                self.tts_unavailable = True
+                if callable(self.on_tts_unavailable):
+                    Clock.schedule_once(lambda *_: self.on_tts_unavailable(), 0)
                 return
 
             result = self.tts.setLanguage(self.Locale.US)
             if int(result) < 0:
                 self.error_message = "系统 TTS 没有可用的英文语音，请下载安装英文语音数据。"
                 self.ready = False
-                self.missing_english_voice = True
-                if callable(self.on_missing_voice):
-                    Clock.schedule_once(lambda *_: self.on_missing_voice(), 0)
+                self.tts_unavailable = True
+                if callable(self.on_tts_unavailable):
+                    Clock.schedule_once(lambda *_: self.on_tts_unavailable(), 0)
                 return
 
-            self.missing_english_voice = False
-
+            self.tts_unavailable = False
             self.tts.setSpeechRate(0.9)
             self.ready = True
             self.error_message = ""
@@ -304,8 +309,8 @@ class VocabTrainer(BoxLayout):
         self.test_pool = []
         self.sequential_key = None
         self.sequential_cursor = 0
-        self._tts_install_popup_open = False
-        self.tts = AndroidTTS(on_missing_voice=self.show_tts_install_prompt)
+        self._tts_prompt_open = False
+        self.tts = AndroidTTS(on_tts_unavailable=self.show_tts_install_prompt)
         self.data_dir = App.get_running_app().user_data_dir
         os.makedirs(self.data_dir, exist_ok=True)
         self.progress_path = os.path.join(self.data_dir, "progress.json")
@@ -450,59 +455,68 @@ class VocabTrainer(BoxLayout):
         self.build_menu()
 
     def show_tts_install_prompt(self, *_):
-        """英文 TTS 语音缺失时，引导用户打开系统语音数据安装页面。"""
-        if self._tts_install_popup_open:
+        """TTS 初始化失败/缺少英文语音时，引导用户去系统安装语音数据。"""
+        if self._tts_prompt_open:
             return
 
-        self._tts_install_popup_open = True
+        self._tts_prompt_open = True
 
-        content = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(14))
-        message = CNLabel(
-            text="未检测到可用的英文 TTS 语音数据。\n\n点击“去下载安装”可打开手机系统的语音数据安装页面。",
+        content = BoxLayout(
+            orientation="vertical",
+            spacing=dp(12),
+            padding=dp(14),
+        )
+
+        msg = CNLabel(
+            text=(
+                "手机当前没有可用的英文 TTS 发音。\n\n"
+                "点击“去下载安装”，打开系统的文字转语音语音数据页面。"
+            ),
             halign="center",
             valign="middle",
-            color=(0.12, 0.16, 0.22, 1),
         )
-        message.bind(size=lambda label, size: setattr(label, "text_size", size))
-        content.add_widget(message)
+        msg.bind(size=lambda inst, value: setattr(inst, "text_size", value))
+        content.add_widget(msg)
 
-        row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(10))
-        cancel_button = CNButton(text="取消")
-        install_button = CNButton(
-            text="去下载安装",
-            background_color=(0.13, 0.45, 0.85, 1),
+        buttons = BoxLayout(
+            size_hint_y=None,
+            height=dp(50),
+            spacing=dp(10),
         )
-        row.add_widget(cancel_button)
-        row.add_widget(install_button)
-        content.add_widget(row)
+        btn_cancel = CNButton(text="取消")
+        btn_install = CNButton(text="去下载安装")
+        buttons.add_widget(btn_cancel)
+        buttons.add_widget(btn_install)
+        content.add_widget(buttons)
 
-        popup_kwargs = {
-            "title": "需要英文语音包",
+        kwargs = {
+            "title": "需要英文 TTS 语音",
             "content": content,
-            "size_hint": (0.88, 0.42),
+            "size_hint": (0.90, 0.42),
             "auto_dismiss": False,
         }
         if CHINESE_FONT_PATH:
-            popup_kwargs["title_font"] = CHINESE_FONT_NAME
+            kwargs["title_font"] = CHINESE_FONT_NAME
 
-        popup = Popup(**popup_kwargs)
+        popup = Popup(**kwargs)
 
         def close_popup(*_args):
-            self._tts_install_popup_open = False
+            self._tts_prompt_open = False
             popup.dismiss()
-
-        cancel_button.bind(on_release=close_popup)
 
         def go_install(*_args):
             close_popup()
             self.open_tts_install_page()
 
-        install_button.bind(on_release=go_install)
-        popup.bind(on_dismiss=lambda *_: setattr(self, "_tts_install_popup_open", False))
+        btn_cancel.bind(on_release=close_popup)
+        btn_install.bind(on_release=go_install)
+        popup.bind(
+            on_dismiss=lambda *_: setattr(self, "_tts_prompt_open", False)
+        )
         popup.open()
 
     def open_tts_install_page(self):
-        """打开 Android 系统 TTS 语音数据安装页面。"""
+        """优先打开 Android 官方 TTS 语音数据安装页；失败则打开 TTS 设置页。"""
         if platform != "android":
             self.show_popup("提示", "该功能只能在 Android 手机上使用。")
             return
@@ -513,25 +527,28 @@ class VocabTrainer(BoxLayout):
             Intent = autoclass("android.content.Intent")
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
 
-            # Android 官方 TTS 语音数据安装 Action。
+            # Android 官方 TTS 语音数据安装入口。
             intent = Intent("android.speech.tts.engine.INSTALL_TTS_DATA")
             PythonActivity.mActivity.startActivity(intent)
+            return
         except Exception:
-            # 部分厂商系统不提供独立安装 Activity，退回到系统 TTS 设置页。
-            try:
-                from jnius import autoclass
+            pass
 
-                Intent = autoclass("android.content.Intent")
-                PythonActivity = autoclass("org.kivy.android.PythonActivity")
-                intent = Intent("android.settings.TTS_SETTINGS")
-                PythonActivity.mActivity.startActivity(intent)
-            except Exception as exc:
-                self.show_popup(
-                    "无法打开",
-                    "手机系统没有提供可直接打开的 TTS 下载页面。\n"
-                    "请到：设置 → 文字转语音/文本转语音 → 安装语音数据。\n\n"
-                    f"错误：{exc}",
-                )
+        try:
+            from jnius import autoclass
+
+            Intent = autoclass("android.content.Intent")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+
+            # 某些厂商没有独立安装页，退回系统 TTS 设置。
+            intent = Intent("android.settings.TTS_SETTINGS")
+            PythonActivity.mActivity.startActivity(intent)
+        except Exception as exc:
+            self.show_popup(
+                "无法打开系统 TTS 页面",
+                "请手动进入：设置 → 文字转语音/文本转语音 → 安装语音数据。\n\n"
+                f"错误：{exc}",
+            )
 
     def import_vocab_file(self, *_):
         """在 Android 上调用系统文件选择器，选择并导入 .txt 词库。"""
@@ -1025,10 +1042,13 @@ class VocabTrainer(BoxLayout):
         if self.current_word:
             ok = self.speak_word(self.current_word["en"])
             if not ok and not self.tts.initializing:
-                self.show_popup(
-                    "发音不可用",
-                    self.tts.error_message or "系统英文 TTS 暂时不可用。请检查手机的文字转语音设置。",
-                )
+                if getattr(self.tts, "tts_unavailable", False):
+                    self.show_tts_install_prompt()
+                else:
+                    self.show_popup(
+                        "发音不可用",
+                        self.tts.error_message or "系统英文 TTS 暂时不可用。请检查手机的文字转语音设置。",
+                    )
 
     def speak_word(self, word):
         return self.tts.speak(word)
