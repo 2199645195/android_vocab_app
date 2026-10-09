@@ -22,8 +22,9 @@ from kivy.uix.spinner import Spinner, SpinnerOption
 # 中文字体支持
 # =========================
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
 FONT_CANDIDATES = [
-    os.path.join(APP_DIR, "fonts", "NotoSansSC-Regular.ttf"),
+    os.path.join(APP_DIR, "fonts", "NotoSansSC-VariableFont_wght.ttf"),
     "/system/fonts/NotoSansCJK-Regular.ttc",
     "/system/fonts/NotoSansSC-Regular.otf",
     "/system/fonts/DroidSansFallback.ttf",
