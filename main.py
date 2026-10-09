@@ -2,6 +2,11 @@ import json
 import os
 import random
 import re
+import hashlib
+import threading
+import urllib.parse
+import urllib.request
+from urllib.error import HTTPError, URLError
 from datetime import datetime
 
 from kivy.app import App
@@ -18,29 +23,6 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner, SpinnerOption
 from kivy.uix.textinput import TextInput
 from kivy.utils import platform
-
-
-# =========================
-# Android TTS 初始化监听器
-# =========================
-try:
-    from jnius import PythonJavaClass, java_method
-
-    class _TTSInitListener(PythonJavaClass):
-        __javainterfaces__ = ["android/speech/tts/TextToSpeech$OnInitListener"]
-        __javacontext__ = "app"
-
-        def __init__(self, owner):
-            super().__init__()
-            self.owner = owner
-
-        @java_method("(I)V")
-        def onInit(self, status):
-            # Java 回调线程里不要直接操作 Kivy UI，切回 Clock。
-            Clock.schedule_once(lambda *_: self.owner._finish_init(status), 0)
-
-except Exception:
-    _TTSInitListener = None
 
 
 # =========================
@@ -95,10 +77,18 @@ class CNSpinner(Spinner):
         super().__init__(**kwargs)
 
 
-def make_popup(title, message, size_hint=(0.86, 0.46)):
+def make_popup(title, message, size_hint=(0.88, 0.38)):
+    label = CNLabel(
+        text=message,
+        halign="center",
+        valign="middle",
+        font_size=dp(16),
+        padding=(dp(12), dp(12)),
+    )
+    label.bind(size=lambda inst, value: setattr(inst, "text_size", (max(1, value[0] - dp(20)), None)))
     popup_kwargs = {
         "title": title,
-        "content": CNLabel(text=message),
+        "content": label,
         "size_hint": size_hint,
     }
     if CHINESE_FONT_PATH:
@@ -184,108 +174,151 @@ def parse_vocab_file(path):
         return parse_vocab_text(vocab_file.read())
 
 
-class AndroidTTS:
-    def __init__(self, on_tts_unavailable=None):
-        self.ready = False
-        self.initializing = False
-        self.tts = None
-        self.listener = None
-        self.pending_word = ""
+class CachedWordAudio:
+    """Free Dictionary API 单词真人音频：后台下载、私有目录缓存、Android MediaPlayer 播放。"""
+
+    def __init__(self, cache_dir, on_error=None):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        self.on_error = on_error
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._player = None
+        self._closed = False
+        self._inflight = set()
         self.error_message = ""
-        self.TextToSpeech = None
-        self.Locale = None
-        self.on_tts_unavailable = on_tts_unavailable
-        self.tts_unavailable = False
 
-        if platform != "android":
-            self.error_message = "当前不是 Android 环境，未启用系统 TTS。"
-            return
+    def _cache_path(self, word):
+        name = hashlib.sha256(word.lower().encode("utf-8")).hexdigest()
+        return os.path.join(self.cache_dir, name + ".mp3")
 
-        try:
-            from jnius import autoclass
+    def _stop_player(self):
+        if self._player is not None:
+            try:
+                self._player.stop()
+            except Exception:
+                pass
+            try:
+                self._player.release()
+            except Exception:
+                pass
+            self._player = None
 
-            if _TTSInitListener is None:
-                raise RuntimeError("PyJNIus TTS listener unavailable")
-
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            self.TextToSpeech = autoclass("android.speech.tts.TextToSpeech")
-            self.Locale = autoclass("java.util.Locale")
-
-            # 必须保留 listener 引用，否则可能被 Python GC 回收。
-            self.listener = _TTSInitListener(self)
-            self.initializing = True
-            self.tts = self.TextToSpeech(PythonActivity.mActivity, self.listener)
-        except Exception as exc:
-            self.initializing = False
-            self.ready = False
-            self.error_message = f"TTS 初始化失败：{exc}"
-
-    def _finish_init(self, status):
-        self.initializing = False
-        try:
-            if self.tts is None or self.TextToSpeech is None:
-                self.error_message = "TTS 对象未创建。"
+    def _notify_error(self, message, generation):
+        def update_ui(_dt):
+            if self._closed or generation != self._generation:
                 return
-
-            if int(status) != int(self.TextToSpeech.SUCCESS):
-                self.error_message = (
-                    f"Android TTS 初始化失败，状态码：{status}。"
-                    "可能是手机没有可用的 TTS 引擎或语音数据。"
-                )
-                self.ready = False
-                self.tts_unavailable = True
-                if callable(self.on_tts_unavailable):
-                    Clock.schedule_once(lambda *_: self.on_tts_unavailable(), 0)
-                return
-
-            result = self.tts.setLanguage(self.Locale.US)
-            if int(result) < 0:
-                self.error_message = "系统 TTS 没有可用的英文语音，请下载安装英文语音数据。"
-                self.ready = False
-                self.tts_unavailable = True
-                if callable(self.on_tts_unavailable):
-                    Clock.schedule_once(lambda *_: self.on_tts_unavailable(), 0)
-                return
-
-            self.tts_unavailable = False
-            self.tts.setSpeechRate(0.9)
-            self.ready = True
-            self.error_message = ""
-
-            if self.pending_word:
-                word = self.pending_word
-                self.pending_word = ""
-                self.speak(word)
-        except Exception as exc:
-            self.ready = False
-            self.error_message = f"TTS 设置失败：{exc}"
+            self.error_message = message
+            if callable(self.on_error):
+                self.on_error(message)
+        Clock.schedule_once(update_ui, 0)
 
     def speak(self, word):
         word = (word or "").strip()
         if not word:
             return False
+        self._generation += 1
+        generation = self._generation
+        self._stop_player()
+        path = self._cache_path(word)
+        if os.path.isfile(path) and os.path.getsize(path) > 100:
+            self._play(path, generation)
+        else:
+            threading.Thread(target=self._download, args=(word, path, generation), daemon=True).start()
+        return True
 
-        if not self.ready:
-            # 初始化尚未结束时先记住，完成后自动读。
-            if self.initializing:
-                self.pending_word = word
-            return False
-
+    def _play(self, path, generation):
+        if self._closed or generation != self._generation:
+            return
+        self._stop_player()
+        if platform == "android":
+            try:
+                from jnius import autoclass
+                player = autoclass("android.media.MediaPlayer")()
+                player.setDataSource(path)
+                player.prepare()
+                player.start()
+                self._player = player
+                return
+            except Exception as exc:
+                self._notify_error("下载成功但播放失败，请检查媒体音量。", generation)
+                return
         try:
-            self.tts.stop()
-            self.tts.speak(word, self.TextToSpeech.QUEUE_FLUSH, None, "vocab-word")
-            return True
-        except Exception as exc:
-            self.error_message = f"播放失败：{exc}"
-            return False
+            from kivy.core.audio import SoundLoader
+            player = SoundLoader.load(path)
+            if player is None:
+                raise RuntimeError("no local mp3 decoder")
+            player.play()
+            self._player = player
+        except Exception:
+            self._notify_error("下载成功，但当前设备无法播放 MP3 音频。", generation)
+
+    def _download(self, word, path, generation):
+        temp_path = None
+        try:
+            api = "https://api.dictionaryapi.dev/api/v2/entries/en/" + urllib.parse.quote(word, safe="")
+            request = urllib.request.Request(api, headers={"User-Agent": "VocabTrainer/1.0"})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                data = response.read(256 * 1024 + 1)
+            if len(data) > 256 * 1024:
+                raise ValueError("词典响应太大")
+            entries = json.loads(data.decode("utf-8"))
+            urls = []
+            for entry in entries if isinstance(entries, list) else []:
+                for phonetic in entry.get("phonetics", []):
+                    url = phonetic.get("audio", "")
+                    if url:
+                        if url.startswith("//"):
+                            url = "https:" + url
+                        urls.append(url)
+            # Android MediaPlayer 优先使用 MP3（词典也可能提供 OGG）。
+            urls.sort(key=lambda x: (".mp3" not in urllib.parse.urlparse(x).path.lower(), x))
+            audio_url = None
+            for url in urls:
+                parsed = urllib.parse.urlparse(url)
+                if parsed.scheme != "https" or parsed.hostname not in (
+                    "ssl.gstatic.com", "upload.wikimedia.org", "commons.wikimedia.org"
+                ):
+                    continue
+                if parsed.path.lower().endswith(".mp3"):
+                    audio_url = url
+                    break
+            if not audio_url:
+                raise LookupError("该单词暂无可用的 MP3 发音")
+            request = urllib.request.Request(audio_url, headers={"User-Agent": "VocabTrainer/1.0"})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                content = response.read(2 * 1024 * 1024 + 1)
+            if len(content) > 2 * 1024 * 1024 or len(content) < 100:
+                raise ValueError("音频大小异常")
+            # MP3 可包含 ID3 tag 或以 MPEG frame 开头。
+            if not (content.startswith(b"ID3") or (content[0] == 0xff and (content[1] & 0xe0) == 0xe0)):
+                raise ValueError("下载内容不是 MP3")
+            temp_path = path + "." + str(generation) + ".tmp"
+            with open(temp_path, "wb") as f:
+                f.write(content)
+            with self._lock:
+                os.replace(temp_path, path)
+            temp_path = None
+            Clock.schedule_once(lambda _dt: self._play(path, generation), 0)
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError, LookupError, json.JSONDecodeError) as exc:
+            if isinstance(exc, (HTTPError, LookupError)) and (isinstance(exc, LookupError) or getattr(exc, "code", 0) == 404):
+                msg = "词典暂未提供该单词的可用 MP3 发音。"
+            else:
+                msg = "音频下载失败，请检查网络后点“再听一次”。"
+            self._notify_error(msg, generation)
+        except Exception:
+            self._notify_error("发音暂不可用，请稍后重试。", generation)
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
 
     def shutdown(self):
-        try:
-            if self.tts is not None:
-                self.tts.stop()
-                self.tts.shutdown()
-        except Exception:
-            pass
+        self._closed = True
+        self._generation += 1
+        self._stop_player()
 
 
 class VocabTrainer(BoxLayout):
@@ -309,10 +342,9 @@ class VocabTrainer(BoxLayout):
         self.test_pool = []
         self.sequential_key = None
         self.sequential_cursor = 0
-        self._tts_prompt_open = False
-        self.tts = AndroidTTS(on_tts_unavailable=self.show_tts_install_prompt)
         self.data_dir = App.get_running_app().user_data_dir
         os.makedirs(self.data_dir, exist_ok=True)
+        self.audio = CachedWordAudio(os.path.join(self.data_dir, "pronunciation_cache"), on_error=self.on_audio_error)
         self.progress_path = os.path.join(self.data_dir, "progress.json")
         self.wrong_path = os.path.join(self.data_dir, "wrong_words.jsonl")
         self.stats_path = os.path.join(self.data_dir, "stats.json")
@@ -454,101 +486,11 @@ class VocabTrainer(BoxLayout):
         self.selected_unit = value
         self.build_menu()
 
-    def show_tts_install_prompt(self, *_):
-        """TTS 初始化失败/缺少英文语音时，引导用户去系统安装语音数据。"""
-        if self._tts_prompt_open:
-            return
-
-        self._tts_prompt_open = True
-
-        content = BoxLayout(
-            orientation="vertical",
-            spacing=dp(12),
-            padding=dp(14),
-        )
-
-        msg = CNLabel(
-            text=(
-                "手机当前没有可用的英文 TTS 发音。\n\n"
-                "点击“去下载安装”，打开系统的文字转语音语音数据页面。"
-            ),
-            halign="center",
-            valign="middle",
-        )
-        msg.bind(size=lambda inst, value: setattr(inst, "text_size", value))
-        content.add_widget(msg)
-
-        buttons = BoxLayout(
-            size_hint_y=None,
-            height=dp(50),
-            spacing=dp(10),
-        )
-        btn_cancel = CNButton(text="取消")
-        btn_install = CNButton(text="去下载安装")
-        buttons.add_widget(btn_cancel)
-        buttons.add_widget(btn_install)
-        content.add_widget(buttons)
-
-        kwargs = {
-            "title": "需要英文 TTS 语音",
-            "content": content,
-            "size_hint": (0.90, 0.42),
-            "auto_dismiss": False,
-        }
-        if CHINESE_FONT_PATH:
-            kwargs["title_font"] = CHINESE_FONT_NAME
-
-        popup = Popup(**kwargs)
-
-        def close_popup(*_args):
-            self._tts_prompt_open = False
-            popup.dismiss()
-
-        def go_install(*_args):
-            close_popup()
-            self.open_tts_install_page()
-
-        btn_cancel.bind(on_release=close_popup)
-        btn_install.bind(on_release=go_install)
-        popup.bind(
-            on_dismiss=lambda *_: setattr(self, "_tts_prompt_open", False)
-        )
-        popup.open()
-
-    def open_tts_install_page(self):
-        """优先打开 Android 官方 TTS 语音数据安装页；失败则打开 TTS 设置页。"""
-        if platform != "android":
-            self.show_popup("提示", "该功能只能在 Android 手机上使用。")
-            return
-
-        try:
-            from jnius import autoclass
-
-            Intent = autoclass("android.content.Intent")
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
-
-            # Android 官方 TTS 语音数据安装入口。
-            intent = Intent("android.speech.tts.engine.INSTALL_TTS_DATA")
-            PythonActivity.mActivity.startActivity(intent)
-            return
-        except Exception:
-            pass
-
-        try:
-            from jnius import autoclass
-
-            Intent = autoclass("android.content.Intent")
-            PythonActivity = autoclass("org.kivy.android.PythonActivity")
-
-            # 某些厂商没有独立安装页，退回系统 TTS 设置。
-            intent = Intent("android.settings.TTS_SETTINGS")
-            PythonActivity.mActivity.startActivity(intent)
-        except Exception as exc:
-            self.show_popup(
-                "无法打开系统 TTS 页面",
-                "请手动进入：设置 → 文字转语音/文本转语音 → 安装语音数据。\n\n"
-                f"错误：{exc}",
-            )
+    def on_audio_error(self, message):
+        # 听音失败时不打断答题；明确提示当前题可选择再试。
+        if hasattr(self, "feedback_label") and self.current_word:
+            if self.is_answering:
+                self.extra_label.text = message
 
     def import_vocab_file(self, *_):
         """在 Android 上调用系统文件选择器，选择并导入 .txt 词库。"""
@@ -944,7 +886,7 @@ class VocabTrainer(BoxLayout):
         self.current_options = options
         for index, button in enumerate(self.option_buttons):
             button.text = f"{chr(65 + index)}. {options[index]['en']}"
-        Clock.schedule_once(lambda *_: self.speak_word(correct["en"]), 0.25)
+        Clock.schedule_once(lambda *_: self.speak_word(correct["en"]) if self.current_word and self.current_word.get("en") == correct["en"] else None, 0.25)
 
     def build_meaning_question(self):
         self.type_label.text = "中文释义"
@@ -1040,18 +982,10 @@ class VocabTrainer(BoxLayout):
 
     def repeat_pronunciation(self):
         if self.current_word:
-            ok = self.speak_word(self.current_word["en"])
-            if not ok and not self.tts.initializing:
-                if getattr(self.tts, "tts_unavailable", False):
-                    self.show_tts_install_prompt()
-                else:
-                    self.show_popup(
-                        "发音不可用",
-                        self.tts.error_message or "系统英文 TTS 暂时不可用。请检查手机的文字转语音设置。",
-                    )
+            self.speak_word(self.current_word["en"])
 
     def speak_word(self, word):
-        return self.tts.speak(word)
+        return self.audio.speak(word)
 
     def save_wrong_word(self, word, qtype):
         existing = self.load_wrong_words()
@@ -1119,7 +1053,7 @@ class VocabTrainerApp(App):
 
     def on_stop(self):
         try:
-            self.trainer.tts.shutdown()
+            self.trainer.audio.shutdown()
         except Exception:
             pass
 
