@@ -5,7 +5,7 @@ package.domain = org.codex.local
 source.dir = .
 source.include_exts = py,txt,json,png,kv
 version = 1.0
-requirements = python3,kivy,pyjnius
+requirements = python3==3.11.9,kivy,pyjnius
 orientation = portrait
 fullscreen = 0
 android.permissions =
@@ -15,7 +15,7 @@ android.ndk = 25b
 android.archs = arm64-v8a, armeabi-v7a
 android.gradle_dependencies =
 android.allow_backup = True
-p4a.branch = master
+p4a.branch = develop
 
 [buildozer]
 log_level = 2
