@@ -17,6 +17,30 @@ from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner, SpinnerOption
 from kivy.uix.textinput import TextInput
+from kivy.utils import platform
+
+
+# =========================
+# Android TTS 初始化监听器
+# =========================
+try:
+    from jnius import PythonJavaClass, java_method
+
+    class _TTSInitListener(PythonJavaClass):
+        __javainterfaces__ = ["android/speech/tts/TextToSpeech$OnInitListener"]
+        __javacontext__ = "app"
+
+        def __init__(self, owner):
+            super().__init__()
+            self.owner = owner
+
+        @java_method("(I)V")
+        def onInit(self, status):
+            # Java 回调线程里不要直接操作 Kivy UI，切回 Clock。
+            Clock.schedule_once(lambda *_: self.owner._finish_init(status), 0)
+
+except Exception:
+    _TTSInitListener = None
 
 
 # =========================
@@ -135,50 +159,126 @@ def parse_word_line(line):
     return None
 
 
-def parse_vocab_file(path):
+def parse_vocab_text(text):
     units = {}
     current_unit = None
-    with open(path, "r", encoding="utf-8") as vocab_file:
-        for raw in vocab_file:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            unit_match = re.match(r"^Unit\s+(\d+)", line, re.I)
-            if unit_match:
-                current_unit = f"Unit {unit_match.group(1)}"
-                units.setdefault(current_unit, [])
-                continue
-            if current_unit is None:
-                continue
-            item = parse_word_line(line)
-            if item:
-                units[current_unit].append(item)
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        unit_match = re.match(r"^Unit\s+(\d+)", line, re.I)
+        if unit_match:
+            current_unit = f"Unit {int(unit_match.group(1))}"
+            units.setdefault(current_unit, [])
+            continue
+        if current_unit is None:
+            continue
+        item = parse_word_line(line)
+        if item:
+            units[current_unit].append(item)
     return units
 
 
+def parse_vocab_file(path):
+    with open(path, "r", encoding="utf-8-sig") as vocab_file:
+        return parse_vocab_text(vocab_file.read())
+
+
 class AndroidTTS:
-    def __init__(self):
+    def __init__(self, on_missing_voice=None):
         self.ready = False
+        self.initializing = False
         self.tts = None
+        self.listener = None
+        self.pending_word = ""
+        self.error_message = ""
+        self.TextToSpeech = None
+        self.Locale = None
+        self.on_missing_voice = on_missing_voice
+        self.missing_english_voice = False
+
+        if platform != "android":
+            self.error_message = "当前不是 Android 环境，未启用系统 TTS。"
+            return
+
         try:
             from jnius import autoclass
 
+            if _TTSInitListener is None:
+                raise RuntimeError("PyJNIus TTS listener unavailable")
+
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
-            TextToSpeech = autoclass("android.speech.tts.TextToSpeech")
-            Locale = autoclass("java.util.Locale")
-            self.TextToSpeech = TextToSpeech
-            self.tts = TextToSpeech(PythonActivity.mActivity, None)
-            self.tts.setLanguage(Locale.US)
-            self.ready = True
-        except Exception:
+            self.TextToSpeech = autoclass("android.speech.tts.TextToSpeech")
+            self.Locale = autoclass("java.util.Locale")
+
+            # 必须保留 listener 引用，否则可能被 Python GC 回收。
+            self.listener = _TTSInitListener(self)
+            self.initializing = True
+            self.tts = self.TextToSpeech(PythonActivity.mActivity, self.listener)
+        except Exception as exc:
+            self.initializing = False
             self.ready = False
+            self.error_message = f"TTS 初始化失败：{exc}"
+
+    def _finish_init(self, status):
+        self.initializing = False
+        try:
+            if self.tts is None or self.TextToSpeech is None:
+                self.error_message = "TTS 对象未创建。"
+                return
+
+            if int(status) != int(self.TextToSpeech.SUCCESS):
+                self.error_message = f"Android TTS 初始化失败，状态码：{status}"
+                self.ready = False
+                return
+
+            result = self.tts.setLanguage(self.Locale.US)
+            if int(result) < 0:
+                self.error_message = "系统 TTS 没有可用的英文语音，请下载安装英文语音数据。"
+                self.ready = False
+                self.missing_english_voice = True
+                if callable(self.on_missing_voice):
+                    Clock.schedule_once(lambda *_: self.on_missing_voice(), 0)
+                return
+
+            self.missing_english_voice = False
+
+            self.tts.setSpeechRate(0.9)
+            self.ready = True
+            self.error_message = ""
+
+            if self.pending_word:
+                word = self.pending_word
+                self.pending_word = ""
+                self.speak(word)
+        except Exception as exc:
+            self.ready = False
+            self.error_message = f"TTS 设置失败：{exc}"
 
     def speak(self, word):
-        if not word or not self.ready:
-            return
+        word = (word or "").strip()
+        if not word:
+            return False
+
+        if not self.ready:
+            # 初始化尚未结束时先记住，完成后自动读。
+            if self.initializing:
+                self.pending_word = word
+            return False
+
         try:
             self.tts.stop()
             self.tts.speak(word, self.TextToSpeech.QUEUE_FLUSH, None, "vocab-word")
+            return True
+        except Exception as exc:
+            self.error_message = f"播放失败：{exc}"
+            return False
+
+    def shutdown(self):
+        try:
+            if self.tts is not None:
+                self.tts.stop()
+                self.tts.shutdown()
         except Exception:
             pass
 
@@ -204,7 +304,8 @@ class VocabTrainer(BoxLayout):
         self.test_pool = []
         self.sequential_key = None
         self.sequential_cursor = 0
-        self.tts = AndroidTTS()
+        self._tts_install_popup_open = False
+        self.tts = AndroidTTS(on_missing_voice=self.show_tts_install_prompt)
         self.data_dir = App.get_running_app().user_data_dir
         os.makedirs(self.data_dir, exist_ok=True)
         self.progress_path = os.path.join(self.data_dir, "progress.json")
@@ -271,8 +372,18 @@ class VocabTrainer(BoxLayout):
         self.unit_spinner.bind(text=self.set_unit)
         self.add_widget(self.unit_spinner)
 
+        import_button = CNButton(
+            text="📄 导入词库文件（TXT）",
+            font_size=dp(17),
+            size_hint_y=None,
+            height=dp(44),
+            background_color=(0.16, 0.48, 0.68, 1),
+        )
+        import_button.bind(on_release=self.import_vocab_file)
+        self.add_widget(import_button)
+
         add_unit_button = CNButton(
-            text="＋ 添加单元 / 单词",
+            text="＋ 手动添加单元 / 单词",
             font_size=dp(17),
             size_hint_y=None,
             height=dp(44),
@@ -337,6 +448,227 @@ class VocabTrainer(BoxLayout):
     def set_unit(self, _spinner, value):
         self.selected_unit = value
         self.build_menu()
+
+    def show_tts_install_prompt(self, *_):
+        """英文 TTS 语音缺失时，引导用户打开系统语音数据安装页面。"""
+        if self._tts_install_popup_open:
+            return
+
+        self._tts_install_popup_open = True
+
+        content = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(14))
+        message = CNLabel(
+            text="未检测到可用的英文 TTS 语音数据。\n\n点击“去下载安装”可打开手机系统的语音数据安装页面。",
+            halign="center",
+            valign="middle",
+            color=(0.12, 0.16, 0.22, 1),
+        )
+        message.bind(size=lambda label, size: setattr(label, "text_size", size))
+        content.add_widget(message)
+
+        row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(10))
+        cancel_button = CNButton(text="取消")
+        install_button = CNButton(
+            text="去下载安装",
+            background_color=(0.13, 0.45, 0.85, 1),
+        )
+        row.add_widget(cancel_button)
+        row.add_widget(install_button)
+        content.add_widget(row)
+
+        popup_kwargs = {
+            "title": "需要英文语音包",
+            "content": content,
+            "size_hint": (0.88, 0.42),
+            "auto_dismiss": False,
+        }
+        if CHINESE_FONT_PATH:
+            popup_kwargs["title_font"] = CHINESE_FONT_NAME
+
+        popup = Popup(**popup_kwargs)
+
+        def close_popup(*_args):
+            self._tts_install_popup_open = False
+            popup.dismiss()
+
+        cancel_button.bind(on_release=close_popup)
+
+        def go_install(*_args):
+            close_popup()
+            self.open_tts_install_page()
+
+        install_button.bind(on_release=go_install)
+        popup.bind(on_dismiss=lambda *_: setattr(self, "_tts_install_popup_open", False))
+        popup.open()
+
+    def open_tts_install_page(self):
+        """打开 Android 系统 TTS 语音数据安装页面。"""
+        if platform != "android":
+            self.show_popup("提示", "该功能只能在 Android 手机上使用。")
+            return
+
+        try:
+            from jnius import autoclass
+
+            Intent = autoclass("android.content.Intent")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+
+            # Android 官方 TTS 语音数据安装 Action。
+            intent = Intent("android.speech.tts.engine.INSTALL_TTS_DATA")
+            PythonActivity.mActivity.startActivity(intent)
+        except Exception:
+            # 部分厂商系统不提供独立安装 Activity，退回到系统 TTS 设置页。
+            try:
+                from jnius import autoclass
+
+                Intent = autoclass("android.content.Intent")
+                PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                intent = Intent("android.settings.TTS_SETTINGS")
+                PythonActivity.mActivity.startActivity(intent)
+            except Exception as exc:
+                self.show_popup(
+                    "无法打开",
+                    "手机系统没有提供可直接打开的 TTS 下载页面。\n"
+                    "请到：设置 → 文字转语音/文本转语音 → 安装语音数据。\n\n"
+                    f"错误：{exc}",
+                )
+
+    def import_vocab_file(self, *_):
+        """在 Android 上调用系统文件选择器，选择并导入 .txt 词库。"""
+        if platform != "android":
+            self.show_popup("提示", "文件选择导入功能需要在 Android 手机上使用。")
+            return
+
+        try:
+            from jnius import autoclass
+            from android import activity
+
+            Intent = autoclass("android.content.Intent")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+
+            self._file_request_code = 24680
+            self._android_activity = activity
+            try:
+                activity.unbind(on_activity_result=self._on_activity_result)
+            except Exception:
+                pass
+            activity.bind(on_activity_result=self._on_activity_result)
+
+            intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.setType("text/plain")
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            PythonActivity.mActivity.startActivityForResult(intent, self._file_request_code)
+        except Exception as exc:
+            self.show_popup("导入失败", f"无法打开系统文件选择器：\n{exc}")
+
+    def _on_activity_result(self, request_code, result_code, intent):
+        if request_code != getattr(self, "_file_request_code", 24680):
+            return
+
+        activity_module = getattr(self, "_android_activity", None)
+        if activity_module is not None:
+            try:
+                activity_module.unbind(on_activity_result=self._on_activity_result)
+            except Exception:
+                pass
+
+        try:
+            from jnius import autoclass
+
+            Activity = autoclass("android.app.Activity")
+            if int(result_code) != int(Activity.RESULT_OK) or intent is None:
+                return
+
+            uri = intent.getData()
+            if uri is None:
+                self.show_popup("导入失败", "没有获取到所选文件。")
+                return
+
+            text = self._read_android_text_uri(uri)
+            self._import_vocab_text(text)
+        except Exception as exc:
+            self.show_popup("导入失败", f"读取词库文件失败：\n{exc}")
+
+    def _read_android_text_uri(self, uri):
+        from jnius import autoclass
+
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        InputStreamReader = autoclass("java.io.InputStreamReader")
+        BufferedReader = autoclass("java.io.BufferedReader")
+
+        resolver = PythonActivity.mActivity.getContentResolver()
+        stream = resolver.openInputStream(uri)
+        if stream is None:
+            raise RuntimeError("无法打开文件流")
+
+        reader = None
+        try:
+            reader = BufferedReader(InputStreamReader(stream, "UTF-8"))
+            lines = []
+            while True:
+                line = reader.readLine()
+                if line is None:
+                    break
+                lines.append(str(line))
+            return "\n".join(lines)
+        finally:
+            try:
+                if reader is not None:
+                    reader.close()
+                else:
+                    stream.close()
+            except Exception:
+                pass
+
+    def _import_vocab_text(self, text):
+        units = parse_vocab_text(text)
+        units = {name: words for name, words in units.items() if words}
+        if not units:
+            self.show_popup(
+                "无法识别",
+                "没有识别到有效单元。\n\nTXT 文件需要包含例如：\nUnit 1\nword | n. | 中文释义",
+            )
+            return
+
+        custom_units = self.load_json(self.custom_units_path, {})
+        total_added = 0
+        imported_names = []
+
+        for unit_name in self._sort_unit_dict_names(units):
+            words = units[unit_name]
+            custom_units.setdefault(unit_name, [])
+            existing = {
+                item.get("en", "").strip().lower()
+                for item in custom_units[unit_name]
+                if isinstance(item, dict)
+            }
+            added_this_unit = 0
+            for item in words:
+                key = item.get("en", "").strip().lower()
+                if key and key not in existing:
+                    custom_units[unit_name].append(item)
+                    existing.add(key)
+                    total_added += 1
+                    added_this_unit += 1
+            imported_names.append(f"{unit_name}（新增 {added_this_unit}）")
+
+        self.save_json(self.custom_units_path, custom_units)
+        first_unit = self._sort_unit_dict_names(units)[0]
+        self.selected_unit = first_unit
+        self.load_vocab()
+        self.build_menu()
+        self.show_popup(
+            "导入成功",
+            "已导入：\n" + "\n".join(imported_names) + f"\n\n共新增 {total_added} 个单词。",
+        )
+
+    @staticmethod
+    def _sort_unit_dict_names(mapping):
+        def key(name):
+            match = re.search(r"\d+", name)
+            return (0, int(match.group())) if match else (1, name.lower())
+        return sorted(mapping, key=key)
 
     def show_add_unit_popup(self, *_):
         content = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
@@ -691,10 +1023,15 @@ class VocabTrainer(BoxLayout):
 
     def repeat_pronunciation(self):
         if self.current_word:
-            self.speak_word(self.current_word["en"])
+            ok = self.speak_word(self.current_word["en"])
+            if not ok and not self.tts.initializing:
+                self.show_popup(
+                    "发音不可用",
+                    self.tts.error_message or "系统英文 TTS 暂时不可用。请检查手机的文字转语音设置。",
+                )
 
     def speak_word(self, word):
-        self.tts.speak(word)
+        return self.tts.speak(word)
 
     def save_wrong_word(self, word, qtype):
         existing = self.load_wrong_words()
@@ -757,7 +1094,14 @@ class VocabTrainer(BoxLayout):
 class VocabTrainerApp(App):
     def build(self):
         self.title = "四级单词训练"
-        return VocabTrainer()
+        self.trainer = VocabTrainer()
+        return self.trainer
+
+    def on_stop(self):
+        try:
+            self.trainer.tts.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
