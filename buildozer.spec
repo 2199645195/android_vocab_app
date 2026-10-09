@@ -4,7 +4,7 @@ package.name = vocabtrainer
 package.domain = org.codex.local
 
 source.dir = .
-source.include_exts = py,txt,json,png,kv
+source.include_exts = py,txt,json,png,kv,ttf
 
 version = 1.0
 
