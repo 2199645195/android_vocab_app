@@ -7,6 +7,7 @@ from datetime import datetime
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
+from kivy.core.text import LabelBase
 from kivy.metrics import dp
 from kivy.properties import BooleanProperty, ListProperty, NumericProperty, ObjectProperty, StringProperty
 from kivy.uix.boxlayout import BoxLayout
@@ -14,7 +15,70 @@ from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
-from kivy.uix.spinner import Spinner
+from kivy.uix.spinner import Spinner, SpinnerOption
+
+
+# =========================
+# 中文字体支持
+# =========================
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+FONT_CANDIDATES = [
+    os.path.join(APP_DIR, "fonts", "NotoSansSC-Regular.ttf"),
+    "/system/fonts/NotoSansCJK-Regular.ttc",
+    "/system/fonts/NotoSansSC-Regular.otf",
+    "/system/fonts/DroidSansFallback.ttf",
+]
+
+CHINESE_FONT_PATH = next((path for path in FONT_CANDIDATES if os.path.exists(path)), "")
+CHINESE_FONT_NAME = "ChineseFont"
+
+if CHINESE_FONT_PATH:
+    LabelBase.register(
+        name=CHINESE_FONT_NAME,
+        fn_regular=CHINESE_FONT_PATH,
+        fn_bold=CHINESE_FONT_PATH,
+        fn_italic=CHINESE_FONT_PATH,
+        fn_bolditalic=CHINESE_FONT_PATH,
+    )
+
+
+def _apply_cn_font(kwargs):
+    if CHINESE_FONT_PATH:
+        kwargs.setdefault("font_name", CHINESE_FONT_NAME)
+    return kwargs
+
+
+class CNLabel(Label):
+    def __init__(self, **kwargs):
+        super().__init__(**_apply_cn_font(kwargs))
+
+
+class CNButton(Button):
+    def __init__(self, **kwargs):
+        super().__init__(**_apply_cn_font(kwargs))
+
+
+class CNSpinnerOption(SpinnerOption):
+    def __init__(self, **kwargs):
+        super().__init__(**_apply_cn_font(kwargs))
+
+
+class CNSpinner(Spinner):
+    def __init__(self, **kwargs):
+        kwargs = _apply_cn_font(kwargs)
+        kwargs.setdefault("option_cls", CNSpinnerOption)
+        super().__init__(**kwargs)
+
+
+def make_popup(title, message, size_hint=(0.86, 0.46)):
+    popup_kwargs = {
+        "title": title,
+        "content": CNLabel(text=message),
+        "size_hint": size_hint,
+    }
+    if CHINESE_FONT_PATH:
+        popup_kwargs["title_font"] = CHINESE_FONT_NAME
+    return Popup(**popup_kwargs)
 
 
 POS_LABELS = {
@@ -160,7 +224,7 @@ class VocabTrainer(BoxLayout):
 
     def build_menu(self, *_):
         self.clear()
-        title = Label(
+        title = CNLabel(
             text="四级单词训练",
             font_size=dp(26),
             bold=True,
@@ -171,7 +235,7 @@ class VocabTrainer(BoxLayout):
         self.add_widget(title)
 
         unit_names = sorted(self.units, key=lambda item: int(re.search(r"\d+", item).group()))
-        self.unit_spinner = Spinner(
+        self.unit_spinner = CNSpinner(
             text=self.selected_unit,
             values=unit_names,
             size_hint_y=None,
@@ -181,7 +245,7 @@ class VocabTrainer(BoxLayout):
         self.unit_spinner.bind(text=self.set_unit)
         self.add_widget(self.unit_spinner)
 
-        self.mode_spinner = Spinner(
+        self.mode_spinner = CNSpinner(
             text="单词听音四选一",
             values=["单词听音四选一", "中文释义", "词性判断", "综合测试"],
             size_hint_y=None,
@@ -189,7 +253,7 @@ class VocabTrainer(BoxLayout):
         )
         self.add_widget(self.mode_spinner)
 
-        self.order_spinner = Spinner(
+        self.order_spinner = CNSpinner(
             text="正序自动记录进度",
             values=["正序自动记录进度", "乱序随机练习"],
             size_hint_y=None,
@@ -197,7 +261,7 @@ class VocabTrainer(BoxLayout):
         )
         self.add_widget(self.order_spinner)
 
-        self.count_spinner = Spinner(
+        self.count_spinner = CNSpinner(
             text="每天 25 个",
             values=["每天 10 个", "每天 15 个", "每天 20 个", "每天 25 个", "每天 30 个", "全部"],
             size_hint_y=None,
@@ -209,8 +273,8 @@ class VocabTrainer(BoxLayout):
         preview_key = self.make_progress_key(self.selected_unit, "listening")
         learned = int(progress.get(preview_key, 0))
         total = len(self.units.get(self.selected_unit, []))
-        self.menu_info = Label(
-            text=f"{self.selected_unit} 共 {total} 个词\\n正序进度：{min(learned, total)} / {total}",
+        self.menu_info = CNLabel(
+            text=f"{self.selected_unit} 共 {total} 个词\n正序进度：{min(learned, total)} / {total}",
             font_size=dp(17),
             halign="center",
             valign="middle",
@@ -219,7 +283,7 @@ class VocabTrainer(BoxLayout):
         self.menu_info.bind(size=lambda label, size: setattr(label, "text_size", size))
         self.add_widget(self.menu_info)
 
-        start_button = Button(
+        start_button = CNButton(
             text="开始",
             font_size=dp(20),
             bold=True,
@@ -230,7 +294,7 @@ class VocabTrainer(BoxLayout):
         start_button.bind(on_release=self.start_quiz)
         self.add_widget(start_button)
 
-        wrong_button = Button(text="查看错题数量", size_hint_y=None, height=dp(44))
+        wrong_button = CNButton(text="查看错题数量", size_hint_y=None, height=dp(44))
         wrong_button.bind(on_release=self.show_wrong_count)
         self.add_widget(wrong_button)
 
@@ -309,30 +373,30 @@ class VocabTrainer(BoxLayout):
     def build_quiz_ui(self):
         self.clear()
         top = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(38), spacing=dp(8))
-        self.score_label = Label(text="答对：0", color=(0.08, 0.12, 0.18, 1), bold=True)
-        self.progress_label = Label(text=f"进度：0 / {self.total_questions}", color=(0.13, 0.45, 0.85, 1), bold=True)
+        self.score_label = CNLabel(text="答对：0", color=(0.08, 0.12, 0.18, 1), bold=True)
+        self.progress_label = CNLabel(text=f"进度：0 / {self.total_questions}", color=(0.13, 0.45, 0.85, 1), bold=True)
         top.add_widget(self.score_label)
         top.add_widget(self.progress_label)
         self.add_widget(top)
 
-        self.type_label = Label(text="", font_size=dp(19), bold=True, size_hint_y=None, height=dp(34), color=(0.13, 0.45, 0.85, 1))
+        self.type_label = CNLabel(text="", font_size=dp(19), bold=True, size_hint_y=None, height=dp(34), color=(0.13, 0.45, 0.85, 1))
         self.add_widget(self.type_label)
 
-        self.word_label = Label(text="", font_size=dp(34), bold=True, color=(0.08, 0.12, 0.18, 1))
+        self.word_label = CNLabel(text="", font_size=dp(34), bold=True, color=(0.08, 0.12, 0.18, 1))
         self.word_label.bind(size=lambda label, size: setattr(label, "text_size", size))
         self.add_widget(self.word_label)
 
-        speak_button = Button(text="再听一次", font_size=dp(18), size_hint_y=None, height=dp(50), background_color=(0.13, 0.45, 0.85, 1))
+        speak_button = CNButton(text="再听一次", font_size=dp(18), size_hint_y=None, height=dp(50), background_color=(0.13, 0.45, 0.85, 1))
         speak_button.bind(on_release=lambda *_: self.repeat_pronunciation())
         self.add_widget(speak_button)
 
-        self.extra_label = Label(text="", font_size=dp(16), size_hint_y=None, height=dp(56), color=(0.26, 0.31, 0.38, 1))
+        self.extra_label = CNLabel(text="", font_size=dp(16), size_hint_y=None, height=dp(56), color=(0.26, 0.31, 0.38, 1))
         self.extra_label.bind(size=lambda label, size: setattr(label, "text_size", size))
         self.add_widget(self.extra_label)
 
         self.option_buttons = []
         for index in range(4):
-            button = Button(
+            button = CNButton(
                 text="",
                 font_size=dp(17),
                 size_hint_y=None,
@@ -348,14 +412,14 @@ class VocabTrainer(BoxLayout):
             self.option_buttons.append(button)
             self.add_widget(button)
 
-        self.feedback_label = Label(text="", font_size=dp(16), size_hint_y=None, height=dp(72), color=(0.2, 0.25, 0.32, 1))
+        self.feedback_label = CNLabel(text="", font_size=dp(16), size_hint_y=None, height=dp(72), color=(0.2, 0.25, 0.32, 1))
         self.feedback_label.bind(size=lambda label, size: setattr(label, "text_size", size))
         self.add_widget(self.feedback_label)
 
         bottom = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(46), spacing=dp(8))
-        self.next_button = Button(text="下一题", disabled=True)
+        self.next_button = CNButton(text="下一题", disabled=True)
         self.next_button.bind(on_release=lambda *_: self.next_question())
-        end_button = Button(text="结束")
+        end_button = CNButton(text="结束")
         end_button.bind(on_release=lambda *_: self.end_test())
         bottom.add_widget(self.next_button)
         bottom.add_widget(end_button)
@@ -467,22 +531,22 @@ class VocabTrainer(BoxLayout):
         self.option_buttons[correct_idx].color = (1, 1, 1, 1)
 
         pos_text = " / ".join(self.current_word.get("pos", [])) or "未标注"
-        detail = f"{self.current_word['en']}  {pos_text}\\n{self.current_word['zh']}"
+        detail = f"{self.current_word['en']}  {pos_text}\n{self.current_word['zh']}"
         if self.current_word.get("family"):
-            detail += f"\\n关联：{self.current_word['family']}"
+            detail += f"\n关联：{self.current_word['family']}"
 
         if is_correct:
             self.score += 1
             if self.type_label.text == "单词听音四选一":
                 self.listening_correct += 1
-            self.feedback_label.text = f"答对了\\n{detail}"
+            self.feedback_label.text = f"答对了\n{detail}"
             self.feedback_label.color = (0.1, 0.55, 0.32, 1)
             self.score_label.text = f"答对：{self.score}"
             Clock.schedule_once(lambda *_: self.next_question(), 0.75)
         else:
             self.option_buttons[idx].background_color = (0.9, 0.18, 0.2, 1)
             self.option_buttons[idx].color = (1, 1, 1, 1)
-            self.feedback_label.text = f"没选对，正确答案：\\n{detail}"
+            self.feedback_label.text = f"没选对，正确答案：\n{detail}"
             self.feedback_label.color = (0.75, 0.12, 0.14, 1)
             self.save_wrong_word(self.current_word, self.type_label.text)
             self.next_button.disabled = False
@@ -535,25 +599,25 @@ class VocabTrainer(BoxLayout):
         total = int(stats.get("listening_total", 0))
         correct = int(stats.get("listening_correct", 0))
         acc = f"{correct / total * 100:.1f}%" if total else "暂无"
-        self.show_popup("学习记录", f"累计错题：{len(wrong)}\\n听音错题：{listening}\\n释义错题：{meaning}\\n词性错题：{pos}\\n\\n听音正确率：{acc}")
+        self.show_popup("学习记录", f"累计错题：{len(wrong)}\n听音错题：{listening}\n释义错题：{meaning}\n词性错题：{pos}\n\n听音正确率：{acc}")
 
     def end_test(self, *_):
         if self.total_answered == 0:
             self.build_menu()
             return
         acc = self.score / self.total_answered * 100
-        message = f"本次完成：{self.total_answered} 个\\n答对：{self.score} 个\\n正确率：{acc:.1f}%"
+        message = f"本次完成：{self.total_answered} 个\n答对：{self.score} 个\n正确率：{acc:.1f}%"
         if self.order_mode == "sequential" and self.sequential_key:
             if self.sequential_cursor >= len(self.all_words):
-                message += "\\n\\n本单元正序已学完，下次会从第 1 个词重新开始。"
+                message += "\n\n本单元正序已学完，下次会从第 1 个词重新开始。"
             else:
-                message += f"\\n\\n进度已保存，下次从第 {self.sequential_cursor + 1} 个词继续。"
-        popup = Popup(title="练习报告", content=Label(text=message), size_hint=(0.86, 0.46))
+                message += f"\n\n进度已保存，下次从第 {self.sequential_cursor + 1} 个词继续。"
+        popup = make_popup("练习报告", message)
         popup.bind(on_dismiss=lambda *_: self.build_menu())
         popup.open()
 
     def show_popup(self, title, message):
-        Popup(title=title, content=Label(text=message), size_hint=(0.86, 0.46)).open()
+        make_popup(title, message).open()
 
 
 class VocabTrainerApp(App):
