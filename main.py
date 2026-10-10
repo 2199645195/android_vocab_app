@@ -6,6 +6,7 @@ import hashlib
 import threading
 import urllib.parse
 import urllib.request
+import ssl
 from urllib.error import HTTPError, URLError
 from datetime import datetime
 
@@ -269,6 +270,8 @@ class CachedWordAudio:
             return "HTTP " + str(exc.code)
         if isinstance(exc, URLError):
             cause = getattr(exc, "reason", None)
+            if isinstance(cause, ssl.SSLCertVerificationError):
+                return "证书校验失败：请检查手机日期、VPN/网络代理或证书链"
             return "URLError: " + str(cause or exc)[:110]
         return (type(exc).__name__ + ": " + str(exc))[:125]
 
@@ -278,7 +281,14 @@ class CachedWordAudio:
             "Accept": "audio/mpeg,audio/*;q=0.9,*/*;q=0.5",
             "Referer": "https://dict.youdao.com/",
         })
-        with urllib.request.urlopen(request, timeout=12) as response:
+        # Use the maintained certifi CA bundle, not an unverified SSL context.
+        # On Python-for-Android, the built-in OpenSSL CA path can be empty.
+        try:
+            import certifi
+        except ImportError as exc:
+            raise RuntimeError("缺少 certifi 证书包，请在 buildozer.spec 的 requirements 中添加 certifi") from exc
+        context = ssl.create_default_context(cafile=certifi.where())
+        with urllib.request.urlopen(request, timeout=12, context=context) as response:
             return self._validate_mp3(response.read(2 * 1024 * 1024 + 1))
 
     def _fetch_android(self, url):
@@ -348,6 +358,8 @@ class CachedWordAudio:
             if content is None:
                 # 只有一个简短的关键错误提示，方便手机截图反馈。
                 unique = list(dict.fromkeys(errors))
+                if any("证书" in e or "SSL" in e or "CertPath" in e for e in unique):
+                    raise RuntimeError("HTTPS 证书校验失败。请确认手机日期正确，关闭 VPN/代理后重试。详情：" + "；".join(unique[:2])[:185])
                 raise RuntimeError("有道下载失败：" + "；".join(unique[:3])[:285])
             if self._closed or generation != self._generation:
                 return
