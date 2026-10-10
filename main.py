@@ -253,51 +253,103 @@ class CachedWordAudio:
         except Exception:
             self._notify_error("下载成功，但当前设备无法播放 MP3 音频。", generation)
 
+    @staticmethod
+    def _validate_mp3(payload):
+        if not (100 <= len(payload) <= 2 * 1024 * 1024):
+            raise ValueError("返回的音频文件过小或过大")
+        if not (payload.startswith(b"ID3") or
+                (len(payload) >= 2 and payload[0] == 0xff and (payload[1] & 0xe0) == 0xe0)):
+            raise ValueError("响应不是 MP3 音频（可能是服务器错误页面）")
+        return payload
+
+    @staticmethod
+    def _error_detail(exc):
+        """短错误文本，不显示 Java 堆栈或占满屏幕。"""
+        if isinstance(exc, HTTPError):
+            return "HTTP " + str(exc.code)
+        if isinstance(exc, URLError):
+            cause = getattr(exc, "reason", None)
+            return "URLError: " + str(cause or exc)[:110]
+        return (type(exc).__name__ + ": " + str(exc))[:125]
+
+    def _fetch_python(self, url):
+        request = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36",
+            "Accept": "audio/mpeg,audio/*;q=0.9,*/*;q=0.5",
+            "Referer": "https://dict.youdao.com/",
+        })
+        with urllib.request.urlopen(request, timeout=12) as response:
+            return self._validate_mp3(response.read(2 * 1024 * 1024 + 1))
+
+    def _fetch_android(self, url):
+        """通过 Android Java HTTPS 栈下载，避免部分兼容环境中的 Python SSL/DNS 问题。"""
+        from jnius import autoclass, jarray
+
+        URL = autoclass("java.net.URL")
+        conn = URL(url).openConnection()
+        stream = None
+        try:
+            conn.setConnectTimeout(12000)
+            conn.setReadTimeout(12000)
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36")
+            conn.setRequestProperty("Accept", "audio/mpeg,audio/*;q=0.9,*/*;q=0.5")
+            conn.setRequestProperty("Referer", "https://dict.youdao.com/")
+            conn.setInstanceFollowRedirects(True)
+            status = conn.getResponseCode()
+            if status != 200:
+                raise ValueError("HTTP " + str(status))
+            stream = conn.getInputStream()
+            buf = jarray('b')(8192)
+            content = bytearray()
+            while True:
+                n = stream.read(buf)
+                if n == -1:
+                    break
+                if n == 0:
+                    continue
+                content.extend((int(b) & 0xff) for b in buf[:n])
+                if len(content) > 2 * 1024 * 1024:
+                    raise ValueError("音频超过 2MB 安全上限")
+            return self._validate_mp3(bytes(content))
+        finally:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+
     def _download(self, word, path, generation):
-        """优先有道英式/美式发音：后台尝试、校验 MP3 并原子缓存。"""
+        """优先 Android 原生网络栈；使用有道发音并缓存。"""
         temp_path = None
         try:
-            # type=2 美音，type=1 英音。下载与缓存不依赖 Android TTS。
             urls = [
                 "https://dict.youdao.com/dictvoice?" + urllib.parse.urlencode({"audio": word, "type": kind})
                 for kind in ("2", "1")
             ]
             errors = []
             content = None
+            fetchers = ([ ("安卓网络", self._fetch_android), ("Python网络", self._fetch_python) ]
+                        if platform == "android" else [("Python网络", self._fetch_python)])
             for url in urls:
-                if self._closed:
+                if self._closed or generation != self._generation:
                     return
-                try:
-                    request = urllib.request.Request(
-                        url,
-                        headers={
-                            "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36",
-                            "Accept": "audio/mpeg,audio/*;q=0.9,*/*;q=0.5",
-                            "Referer": "https://dict.youdao.com/",
-                        },
-                    )
-                    with urllib.request.urlopen(request, timeout=12) as response:
-                        content_type = response.headers.get("Content-Type", "").lower()
-                        candidate = response.read(2 * 1024 * 1024 + 1)
-                    if not (100 <= len(candidate) <= 2 * 1024 * 1024):
-                        raise ValueError("音频长度不合理")
-                    # 有道 dictvoice 通常返回 MPEG audio；防止 HTML 错误页进入缓存。
-                    is_mp3 = (candidate.startswith(b"ID3") or
-                              (candidate[0] == 0xff and (candidate[1] & 0xe0) == 0xe0))
-                    if not is_mp3:
-                        raise ValueError("服务器未返回 MP3" + (" (" + content_type[:32] + ")" if content_type else ""))
-                    content = candidate
+                for label, fetch in fetchers:
+                    try:
+                        content = fetch(url)
+                        break
+                    except Exception as exc:
+                        errors.append(label + " " + self._error_detail(exc))
+                if content is not None:
                     break
-                except HTTPError as exc:
-                    errors.append(f"HTTP {exc.code}")
-                except (URLError, TimeoutError, OSError) as exc:
-                    errors.append("网络连接异常：" + type(exc).__name__)
-                except ValueError as exc:
-                    errors.append(str(exc))
-
             if content is None:
-                raise RuntimeError("有道发音下载失败（" + "；".join(errors[:2]) + "）")
-            if self._closed:
+                # 只有一个简短的关键错误提示，方便手机截图反馈。
+                unique = list(dict.fromkeys(errors))
+                raise RuntimeError("有道下载失败：" + "；".join(unique[:3])[:285])
+            if self._closed or generation != self._generation:
                 return
             temp_path = path + "." + str(generation) + ".tmp"
             with open(temp_path, "wb") as output:
@@ -306,10 +358,8 @@ class CachedWordAudio:
                 os.replace(temp_path, path)
             temp_path = None
             Clock.schedule_once(lambda _dt: self._play(path, generation), 0)
-        except (ConnectionError, RuntimeError, ValueError, LookupError, OSError) as exc:
-            self._notify_error("发音失败：" + str(exc)[:160], generation)
         except Exception as exc:
-            self._notify_error("发音异常：" + type(exc).__name__ + "（请反馈此信息）", generation)
+            self._notify_error("发音失败：" + str(exc)[:300], generation)
         finally:
             if temp_path:
                 try:
