@@ -609,9 +609,14 @@ class VocabTrainer(BoxLayout):
                 return
 
             text = self._read_android_text_uri(uri)
-            self._import_vocab_text(text)
+            # Android activity result 不保证运行在 Kivy 主线程。
+            # 文件读取完毕后，将界面和数据更新排到 Kivy 主线程执行。
+            Clock.schedule_once(lambda _dt, value=text: self._import_vocab_text(value), 0)
         except Exception as exc:
-            self.show_popup("导入失败", f"读取词库文件失败：\n{exc}")
+            error_message = f"读取词库文件失败：\n{exc}"
+            Clock.schedule_once(
+                lambda _dt, msg=error_message: self.show_popup("导入失败", msg), 0
+            )
 
     def _read_android_text_uri(self, uri):
         from jnius import autoclass
@@ -680,7 +685,13 @@ class VocabTrainer(BoxLayout):
         first_unit = self._sort_unit_dict_names(units)[0]
         self.selected_unit = first_unit
         self.load_vocab()
+
+        # 重新构建单元下拉框、数量和进度说明，立即显示新导入的单元。
+        # 此方法现由 Clock 调用，处于 Kivy UI 主线程。
         self.build_menu()
+        self.unit_spinner.values = self.sorted_unit_names()
+        self.unit_spinner.text = self.selected_unit
+
         self.show_popup(
             "导入成功",
             "已导入：\n" + "\n".join(imported_names) + f"\n\n共新增 {total_added} 个单词。",
