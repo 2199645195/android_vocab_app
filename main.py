@@ -1,4 +1,9 @@
 import json
+import io
+import zipfile
+import shutil
+import math
+import time
 import os
 import random
 import re
@@ -21,6 +26,7 @@ from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
+from kivy.graphics import Color, RoundedRectangle, Rectangle
 from kivy.uix.spinner import Spinner, SpinnerOption
 from kivy.uix.textinput import TextInput
 from kivy.utils import platform
@@ -415,7 +421,19 @@ class VocabTrainer(BoxLayout):
         self.custom_units_path = os.path.join(self.data_dir, "custom_units.json")
         self.review_path = os.path.join(self.data_dir, "review_schedule.json")
         self.activity_path = os.path.join(self.data_dir, "study_activity.json")
+        self.favorites_path = os.path.join(self.data_dir, "favorites.json")
+        self.cards_path = os.path.join(self.data_dir, "card_schedule.json")
+        self.details_path = os.path.join(self.data_dir, "word_details.json")
+        self.card_queue = []
+        self.card_current = None
+        self.card_revealed = False
+        self._saf_action = "import_vocab"
+
         self.review_mode = False
+        self.ui_mode_text = "单词听音四选一"
+        self.ui_order_text = "正序自动记录进度"
+        self.ui_count_text = "每天 25 个"
+        self.active_tab = "home"
         self._advance_event = None
         self.session_words = set()
         self.session_wrong = 0
@@ -460,133 +478,154 @@ class VocabTrainer(BoxLayout):
     def clear(self):
         self.clear_widgets()
 
+    # V1.3 的 UI 专用组件：不改变词库、答题、复习与音频实现。
+    def _panel(self, parent, bg=(1, 1, 1, 1), pad=15, gap=10):
+        panel = BoxLayout(orientation="vertical", size_hint_y=None, padding=dp(pad), spacing=dp(gap))
+        panel.bind(minimum_height=panel.setter("height"))
+        with panel.canvas.before:
+            shade = Color(*bg)
+            rect = RoundedRectangle(pos=panel.pos, size=panel.size, radius=[dp(16)])
+        panel.bind(pos=lambda inst, value: setattr(rect, "pos", value),
+                   size=lambda inst, value: setattr(rect, "size", value))
+        parent.add_widget(panel)
+        return panel
+
+    def _label(self, parent, value, height=33, size=16, dark=True, bold=False, align="left"):
+        lab = CNLabel(text=str(value), font_size=dp(size), bold=bold, size_hint_y=None,
+                      height=dp(height), color=(0.12, 0.21, 0.24, 1) if dark else (0.39, 0.46, 0.49, 1),
+                      halign=align, valign="middle")
+        lab.bind(size=lambda obj, val: setattr(obj, "text_size", (max(1, val[0]), None)))
+        parent.add_widget(lab)
+        return lab
+
+    def _action(self, parent, label, handler, color=(0.12, 0.42, 0.35, 1), height=52):
+        btn = CNButton(text=label, font_size=dp(16), size_hint_y=None, height=dp(height),
+                       background_normal="", background_color=color)
+        btn.bind(on_release=handler)
+        parent.add_widget(btn)
+        return btn
+
+    def _spinner(self, parent, value, values, callback=None):
+        spin = CNSpinner(text=value, values=values, size_hint_y=None, height=dp(49),
+                         background_normal="", background_color=(0.90, 0.95, 0.93, 1),
+                         color=(0.10, 0.28, 0.25, 1), font_size=dp(16))
+        if callback:
+            spin.bind(text=callback)
+        parent.add_widget(spin)
+        return spin
+
+    def _change_tab(self, tab):
+        self.active_tab = tab
+        self.build_menu()
+
+    def _change_unit(self, _spinner, name):
+        if name != self.selected_unit:
+            self.selected_unit = name
+            self.build_menu()
+
     def build_menu(self, *_):
+        """V1.3: 五个清晰的页面 + 常驻底部导航，业务功能保留。"""
         self.clear()
-        scroller = ScrollView(do_scroll_x=False)
-        menu = BoxLayout(orientation="vertical", spacing=dp(10), padding=[dp(4), dp(4), dp(4), dp(18)], size_hint_y=None)
-        menu.bind(minimum_height=menu.setter("height"))
-        scroller.add_widget(menu)
-        self.add_widget(scroller)
-        title = CNLabel(
-            text="四级单词训练",
-            font_size=dp(26),
-            bold=True,
-            size_hint_y=None,
-            height=dp(46),
-            color=(0.08, 0.12, 0.18, 1),
-        )
-        menu.add_widget(title)
+        Window.clearcolor = (0.945, 0.965, 0.961, 1)
+        scroll = ScrollView(do_scroll_x=False, bar_width=dp(3))
+        body = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(12),
+                         padding=[dp(2), dp(9), dp(2), dp(16)])
+        body.bind(minimum_height=body.setter("height"))
+        scroll.add_widget(body)
+        self.add_widget(scroll)
 
-        unit_names = self.sorted_unit_names()
-        self.unit_spinner = CNSpinner(
-            text=self.selected_unit,
-            values=unit_names,
-            size_hint_y=None,
-            height=dp(46),
-            background_color=(0.13, 0.45, 0.85, 1),
-        )
-        self.unit_spinner.bind(text=self.set_unit)
-        menu.add_widget(self.unit_spinner)
+        names = {"home": "今日学习", "library": "我的词库", "wrong": "错题与复习", "stats": "学习数据", "settings": "学习设置"}
+        self._label(body, "四级单词训练", height=54, size=27, bold=True)
+        self._label(body, names.get(self.active_tab, "今日学习"), height=36, size=19, bold=True)
 
-        import_button = CNButton(
-            text="📄 导入词库文件（TXT）",
-            font_size=dp(17),
-            size_hint_y=None,
-            height=dp(44),
-            background_color=(0.16, 0.48, 0.68, 1),
-        )
-        import_button.bind(on_release=self.import_vocab_file)
-        menu.add_widget(import_button)
+        if self.active_tab == "home":
+            summary = self._panel(body, bg=(0.12, 0.42, 0.35, 1))
+            self._label(summary, "今天继续进步一点", height=35, size=19, dark=True, bold=True).color=(1,1,1,1)
+            activity = self.load_json(self.activity_path, {})
+            td = activity.get(date.today().isoformat(), {}) if isinstance(activity,dict) else {}
+            td = td if isinstance(td,dict) else {}
+            done = int(td.get('answered',0)); correct=int(td.get('correct',0))
+            acc=correct/done*100 if done else 0
+            target_match = re.search(r'\d+', self.ui_count_text)
+            daily_goal = int(target_match.group()) if target_match else len(self.units.get(self.selected_unit,[]))
+            self._label(summary, f"今日练习  {done} / {daily_goal} 题", height=50,size=23,bold=True).color=(1,1,1,1)
+            self._label(summary, f"今日正确率 {acc:.1f}%     待复习 {len(self.get_due_words())} 词",height=38,size=14).color=(0.86,0.96,0.92,1)
+            wordpanel = self._panel(body)
+            self._label(wordpanel,"当前学习单元",size=15, dark=False)
+            self.unit_spinner = self._spinner(wordpanel,self.selected_unit,self.sorted_unit_names(),self._change_unit)
+            total=len(self.units.get(self.selected_unit,[]))
+            done_idx=int(self.load_progress().get(self.make_progress_key(self.selected_unit,"listening"),0))
+            self._label(wordpanel,f"正序进度  {min(done_idx,total)} / {total} 词",size=16,bold=True)
+            actions=self._panel(body)
+            self._label(actions,"开始今天的任务",size=18,bold=True)
+            self._action(actions,"开始学习",self.start_quiz,height=57)
+            self._action(actions,"单词卡片 · 认识/模糊/不认识",lambda *_:self.start_cards('unit'),color=(.22,.39,.57,1))
+            self._action(actions,f"智能复习 · {len(self.get_due_words())} 词",self.start_review,color=(0.72,0.45,0.18,1),height=57)
+            self._label(actions,"练习模式和每日数量可在底部「设置」调整",size=12,dark=False,height=25)
+        elif self.active_tab == "library":
+            panel=self._panel(body)
+            self._label(panel,"单元选择",bold=True)
+            self.unit_spinner=self._spinner(panel,self.selected_unit,self.sorted_unit_names(),self._change_unit)
+            self._label(panel,f"当前单元：{len(self.units.get(self.selected_unit, []))} 个单词",dark=False)
+            self._action(panel,"从手机导入 TXT 词库",self.import_vocab_file)
+            self._action(panel,"手动添加单元和单词",self.show_add_unit_popup,color=(0.22,0.39,0.56,1))
+            self._action(panel,"搜索单词 / 编辑音标例句 / 收藏",self.show_word_search)
+            self._action(panel,"我的收藏夹",self.show_favorites,color=(.22,.39,.57,1))
+            self._action(panel,"复习收藏单词卡片",lambda *_:self.start_cards('favorites'))
+            self._label(panel,"导入后单元列表立即更新，新词库保存在手机内",size=13,dark=False,height=48)
+        elif self.active_tab == "wrong":
+            panel=self._panel(body)
+            records=[v for v in self.review_schedule.values() if isinstance(v,dict) and int(v.get('wrong',0))>0]
+            self._label(panel,f"历史错词  {len(records)} 个",height=54,size=23,bold=True)
+            self._label(panel,f"到期复习  {len(self.get_due_words())} 个",height=38,size=18)
+            self._action(panel,"查看具体错词与错误次数",self.show_wrong_book)
+            self._action(panel,"开始到期复习",self.start_review,color=(0.72,0.45,0.18,1))
+            self._action(panel,"到期记忆卡片复习",lambda *_:self.start_cards('due'))
+            self._action(panel,"查看旧版错题分类",self.show_wrong_count,color=(0.34,0.43,0.47,1))
+        elif self.active_tab == "stats":
+            activity=self.load_json(self.activity_path,{})
+            activity=activity if isinstance(activity,dict) else {}
+            td=activity.get(date.today().isoformat(),{})
+            td=td if isinstance(td,dict) else {}
+            answered=int(td.get('answered',0)); correct=int(td.get('correct',0))
+            panel=self._panel(body)
+            self._label(panel,"今日学习概览",size=18,bold=True)
+            self._label(panel,f"答题数量    {answered} 题",height=44,size=21,bold=True)
+            self._label(panel,f"今日答对    {correct} 题",height=44,size=20)
+            self._label(panel,f"今日正确率    {correct / answered * 100 if answered else 0:.1f}%",height=44,size=20)
+            self._action(panel,"查看完整学习统计报告",self.show_dashboard)
+            self._action(panel,"近28天学习日历与趋势",self.show_calendar)
+        elif self.active_tab == "settings":
+            panel=self._panel(body)
+            self._label(panel,"练习模式",bold=True)
+            self.mode_spinner=self._spinner(panel,self.ui_mode_text,["单词听音四选一","中文释义","词性判断","综合测试"],
+                    lambda obj,val:setattr(self,'ui_mode_text',val))
+            self._label(panel,"单词顺序",bold=True)
+            self.order_spinner=self._spinner(panel,self.ui_order_text,["正序自动记录进度","乱序随机练习"],
+                    lambda obj,val:setattr(self,'ui_order_text',val))
+            self._label(panel,"每次练习数量",bold=True)
+            self.count_spinner=self._spinner(panel,self.ui_count_text,["每天 10 个","每天 15 个","每天 20 个","每天 25 个","每天 30 个","全部"],
+                    lambda obj,val:setattr(self,'ui_count_text',val))
+            self._label(panel,"更改后返回首页点击「开始学习」即会生效",size=13,dark=False,height=45)
+            self._label(panel,"数据安全与备份",bold=True)
+            self._action(panel,"导出学习记录 ZIP 备份",lambda *_:self._launch_saf('export_backup'))
+            self._action(panel,"从 ZIP 恢复学习记录",lambda *_:self._launch_saf('import_backup'),color=(.30,.42,.57,1))
+            self._label(panel,"恢复会覆盖对应本地记录，请先导出当前备份",height=42,size=13,dark=False)
 
-        add_unit_button = CNButton(
-            text="＋ 手动添加单元 / 单词",
-            font_size=dp(17),
-            size_hint_y=None,
-            height=dp(44),
-            background_color=(0.20, 0.38, 0.62, 1),
-        )
-        add_unit_button.bind(on_release=self.show_add_unit_popup)
-        menu.add_widget(add_unit_button)
-
-        self.mode_spinner = CNSpinner(
-            text="单词听音四选一",
-            values=["单词听音四选一", "中文释义", "词性判断", "综合测试"],
-            size_hint_y=None,
-            height=dp(46),
-        )
-        menu.add_widget(self.mode_spinner)
-
-        self.order_spinner = CNSpinner(
-            text="正序自动记录进度",
-            values=["正序自动记录进度", "乱序随机练习"],
-            size_hint_y=None,
-            height=dp(46),
-        )
-        menu.add_widget(self.order_spinner)
-
-        self.count_spinner = CNSpinner(
-            text="每天 25 个",
-            values=["每天 10 个", "每天 15 个", "每天 20 个", "每天 25 个", "每天 30 个", "全部"],
-            size_hint_y=None,
-            height=dp(46),
-        )
-        menu.add_widget(self.count_spinner)
-
-        progress = self.load_progress()
-        preview_key = self.make_progress_key(self.selected_unit, "listening")
-        learned = int(progress.get(preview_key, 0))
-        total = len(self.units.get(self.selected_unit, []))
-        self.menu_info = CNLabel(
-            text=f"{self.selected_unit} 共 {total} 个词\n正序进度：{min(learned, total)} / {total}",
-            font_size=dp(17),
-            halign="center",
-            valign="middle",
-            color=(0.2, 0.25, 0.32, 1),
-        )
-        self.menu_info.bind(size=lambda label, size: setattr(label, "text_size", size))
-        menu.add_widget(self.menu_info)
-
-        start_button = CNButton(
-            text="开始",
-            font_size=dp(20),
-            bold=True,
-            size_hint_y=None,
-            height=dp(54),
-            background_color=(0.12, 0.62, 0.36, 1),
-        )
-        start_button.bind(on_release=self.start_quiz)
-        menu.add_widget(start_button)
-
-        wrong_button = CNButton(text="查看错题数量", size_hint_y=None, height=dp(44))
-        wrong_button.bind(on_release=self.show_wrong_count)
-        menu.add_widget(wrong_button)
-
-        due = len(self.get_due_words())
-        review_button = CNButton(
-            text=f"今日待复习：{due} 词  |  开始自动复习",
-            font_size=dp(17), size_hint_y=None, height=dp(50),
-            background_color=(0.73, 0.37, 0.13, 1),
-        )
-        review_button.bind(on_release=self.start_review)
-        menu.add_widget(review_button)
-
-        dashboard_button = CNButton(
-            text="学习进度 · 每日统计 · 错题本",
-            font_size=dp(17), size_hint_y=None, height=dp(48),
-            background_color=(0.16, 0.43, 0.56, 1),
-        )
-        dashboard_button.bind(on_release=self.show_dashboard)
-        menu.add_widget(dashboard_button)
-
-        wrongbook_button = CNButton(
-            text="打开错题本 · 查看单词详情", size_hint_y=None, height=dp(46)
-        )
-        wrongbook_button.bind(on_release=self.show_wrong_book)
-        menu.add_widget(wrongbook_button)
+        # 五页导航始终位于底部，而不是随页面滚动。
+        nav = BoxLayout(size_hint_y=None,height=dp(60),spacing=dp(3))
+        items=[('home','首页'),('library','词库'),('wrong','错题'),('stats','统计'),('settings','设置')]
+        for key,label in items:
+            selected=(self.active_tab==key)
+            button=CNButton(text=label,font_size=dp(14),background_normal="",
+                            background_color=(0.12,0.42,0.35,1) if selected else (0.89,0.94,0.92,1),
+                            color=(1,1,1,1) if selected else (0.18,0.34,0.30,1))
+            button.bind(on_release=lambda _,tab=key:self._change_tab(tab))
+            nav.add_widget(button)
+        self.add_widget(nav)
 
     def set_unit(self, _spinner, value):
-        self.selected_unit = value
-        self.build_menu()
+        self._change_unit(_spinner,value)
 
     def on_audio_error(self, message):
         # 听音失败时不打断答题；明确提示当前题可选择再试。
@@ -608,6 +647,7 @@ class VocabTrainer(BoxLayout):
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
 
             self._file_request_code = 24680
+            self._saf_action = "import_vocab"
             self._android_activity = activity
             try:
                 activity.unbind(on_activity_result=self._on_activity_result)
@@ -626,35 +666,148 @@ class VocabTrainer(BoxLayout):
     def _on_activity_result(self, request_code, result_code, intent):
         if request_code != getattr(self, "_file_request_code", 24680):
             return
-
         activity_module = getattr(self, "_android_activity", None)
         if activity_module is not None:
             try:
                 activity_module.unbind(on_activity_result=self._on_activity_result)
             except Exception:
                 pass
-
         try:
             from jnius import autoclass
-
             Activity = autoclass("android.app.Activity")
             if int(result_code) != int(Activity.RESULT_OK) or intent is None:
                 return
-
             uri = intent.getData()
             if uri is None:
-                self.show_popup("导入失败", "没有获取到所选文件。")
-                return
-
-            text = self._read_android_text_uri(uri)
-            # Android activity result 不保证运行在 Kivy 主线程。
-            # 文件读取完毕后，将界面和数据更新排到 Kivy 主线程执行。
-            Clock.schedule_once(lambda _dt, value=text: self._import_vocab_text(value), 0)
+                raise RuntimeError("没有获取到文件")
+            action = getattr(self, "_saf_action", "import_vocab")
+            if action == "export_backup":
+                data = self.create_backup_bytes()
+                from jnius import autoclass
+                PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                stream = PythonActivity.mActivity.getContentResolver().openOutputStream(uri)
+                if stream is None:
+                    raise RuntimeError("无法写入所选文件")
+                try:
+                    # 使用 Java OutputStream.write(int)，避免 PyJNIus 对 byte[] 的签名差异。
+                    for byte in data:
+                        stream.write(int(byte))
+                    stream.flush()
+                finally:
+                    stream.close()
+                Clock.schedule_once(lambda _dt: self.show_popup("备份成功", "备份 ZIP 已保存到你选择的位置。"), 0)
+            elif action == "import_backup":
+                payload = self._read_android_bytes_uri(uri)
+                Clock.schedule_once(lambda _dt, blob=payload: self.restore_backup_bytes(blob), 0)
+            else:
+                content = self._read_android_text_uri(uri)
+                Clock.schedule_once(lambda _dt, value=content: self._import_vocab_text(value), 0)
         except Exception as exc:
-            error_message = f"读取词库文件失败：\n{exc}"
-            Clock.schedule_once(
-                lambda _dt, msg=error_message: self.show_popup("导入失败", msg), 0
-            )
+            error_message = f"文件处理失败：\n{type(exc).__name__}: {exc}"
+            Clock.schedule_once(lambda _dt, msg=error_message: self.show_popup("操作失败", msg), 0)
+
+    def _read_android_bytes_uri(self, uri):
+        from jnius import autoclass
+        PythonActivity = autoclass("org.kivy.android.PythonActivity")
+        stream = PythonActivity.mActivity.getContentResolver().openInputStream(uri)
+        if stream is None:
+            raise RuntimeError("无法读取备份")
+        out = bytearray()
+        try:
+            while True:
+                value = int(stream.read())
+                if value == -1:
+                    break
+                out.append(value)
+                if len(out) > 25 * 1024 * 1024:
+                    raise ValueError("备份超过 25MB，已停止读取")
+        finally:
+            stream.close()
+        return bytes(out)
+
+    def _launch_saf(self, action):
+        if platform != "android":
+            self.show_popup("提示", "请在 Android/鸿蒙兼容环境中用系统文件选择器备份或恢复。")
+            return
+        try:
+            from jnius import autoclass
+            from android import activity
+            Intent = autoclass("android.content.Intent")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            self._file_request_code = 24680
+            self._saf_action = action
+            self._android_activity = activity
+            try:
+                activity.unbind(on_activity_result=self._on_activity_result)
+            except Exception:
+                pass
+            activity.bind(on_activity_result=self._on_activity_result)
+            if action == "export_backup":
+                intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
+                intent.addCategory(Intent.CATEGORY_OPENABLE)
+                intent.setType("application/zip")
+                intent.putExtra(Intent.EXTRA_TITLE, f"vocab_backup_{date.today().isoformat()}.zip")
+                intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            else:
+                intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                intent.addCategory(Intent.CATEGORY_OPENABLE)
+                intent.setType("application/zip")
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            PythonActivity.mActivity.startActivityForResult(intent, self._file_request_code)
+        except Exception as exc:
+            self.show_popup("文件选择器不可用", f"{type(exc).__name__}: {exc}")
+
+    def create_backup_bytes(self):
+        names = ["progress.json", "wrong_words.jsonl", "stats.json", "custom_units.json",
+                 "review_schedule.json", "study_activity.json", "favorites.json",
+                 "card_schedule.json", "word_details.json"]
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("manifest.json", json.dumps({"format": "vocabtrainer-v14", "created": datetime.now().isoformat(), "files": names}))
+            for name in names:
+                path = os.path.join(self.data_dir, name)
+                if os.path.isfile(path):
+                    zf.write(path, arcname=name)
+        return buf.getvalue()
+
+    def restore_backup_bytes(self, payload):
+        """Validate entire ZIP before touching any user files; never restore arbitrary paths."""
+        allowed = {"progress.json", "wrong_words.jsonl", "stats.json", "custom_units.json",
+                   "review_schedule.json", "study_activity.json", "favorites.json",
+                   "card_schedule.json", "word_details.json"}
+        try:
+            if len(payload) > 25 * 1024 * 1024:
+                raise ValueError("ZIP 体积过大")
+            pending = {}
+            with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+                if manifest.get("format") != "vocabtrainer-v14":
+                    raise ValueError("不是本程序 V1.4 生成的备份")
+                for info in zf.infolist():
+                    if info.filename == "manifest.json":
+                        continue
+                    if info.filename not in allowed or info.is_dir() or info.file_size > 8 * 1024 * 1024:
+                        raise ValueError("备份中含有非法或过大的文件")
+                    content = zf.read(info)
+                    if info.filename.endswith(".json"):
+                        json.loads(content.decode("utf-8"))
+                    else:
+                        for line in content.decode("utf-8").splitlines():
+                            if line.strip():
+                                json.loads(line)
+                    pending[info.filename] = content
+            for filename, content in pending.items():
+                dest = os.path.join(self.data_dir, filename)
+                tmp = dest + ".restore.tmp"
+                with open(tmp, "wb") as fp:
+                    fp.write(content)
+                os.replace(tmp, dest)
+            self.review_schedule = self.load_json(self.review_path, {})
+            self.load_vocab()
+            self.build_menu()
+            self.show_popup("恢复成功", f"已恢复 {len(pending)} 项数据。\n不会覆盖现有 MP3 缓存。")
+        except Exception as exc:
+            self.show_popup("恢复失败", f"数据没有通过校验：\n{type(exc).__name__}: {exc}")
 
     def _read_android_text_uri(self, uri):
         from jnius import autoclass
@@ -727,8 +880,9 @@ class VocabTrainer(BoxLayout):
         # 重新构建单元下拉框、数量和进度说明，立即显示新导入的单元。
         # 此方法现由 Clock 调用，处于 Kivy UI 主线程。
         self.build_menu()
-        self.unit_spinner.values = self.sorted_unit_names()
-        self.unit_spinner.text = self.selected_unit
+        if hasattr(self, "unit_spinner"):
+            self.unit_spinner.values = self.sorted_unit_names()
+            self.unit_spinner.text = self.selected_unit
 
         self.show_popup(
             "导入成功",
@@ -984,6 +1138,9 @@ class VocabTrainer(BoxLayout):
         self.next_question()
 
     def show_dashboard(self, *_):
+        fresh = self.load_json(self.review_path, {})
+        if isinstance(fresh, dict):
+            self.review_schedule = fresh
         activity = self.load_json(self.activity_path, {})
         if not isinstance(activity, dict):
             activity = {}
@@ -996,7 +1153,7 @@ class VocabTrainer(BoxLayout):
             if isinstance(day, dict):
                 unique_all.update(day.get("unique", []))
         due = len(self.get_due_words())
-        ever_wrong = [r for r in self.review_schedule.values() if int(r.get("wrong", 0)) > 0]
+        ever_wrong = [r for r in self.review_schedule.values() if isinstance(r, dict) and int(r.get("wrong", 0)) > 0]
         mastered = sum(1 for r in self.review_schedule.values() if int(r.get("level", 0)) >= 4)
         total_vocab = len({self.word_key(w) for words in self.units.values() for w in words})
         streak = 0
@@ -1023,24 +1180,35 @@ class VocabTrainer(BoxLayout):
         self.show_report_popup("学习进度与复习报告", report)
 
     def show_report_popup(self, title, report):
-        scroll = ScrollView(do_scroll_x=False)
-        content = CNLabel(
-            text=report,
-            font_size=dp(15),
-            halign="left", valign="top",
-            size_hint_y=None,
-            padding=[dp(12), dp(12)],
-            color=(0.12, 0.16, 0.22, 1),
+        """用可滚动的只读 TextInput 展示记录，避免 Label 计算高度后空白。"""
+        view = TextInput(
+            text=str(report), readonly=True, multiline=True,
+            font_size=dp(17), foreground_color=(0.10, 0.15, 0.22, 1),
+            background_color=(1, 1, 1, 1),
+            cursor_blink=False, padding=[dp(14), dp(16), dp(14), dp(16)],
         )
-        content.bind(width=lambda obj, width: setattr(obj, "text_size", (max(width - dp(24), 1), None)))
-        content.bind(texture_size=lambda obj, value: setattr(obj, "height", max(dp(140), value[1] + dp(30))))
-        scroll.add_widget(content)
-        kwargs = {"title": title, "content": scroll, "size_hint": (0.93, 0.73)}
+        if CHINESE_FONT_PATH:
+            view.font_name = CHINESE_FONT_NAME
+
+        wrapper = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(8))
+        wrapper.add_widget(view)
+        close_btn = CNButton(
+            text="关闭", size_hint_y=None, height=dp(48),
+            background_color=(0.13, 0.40, 0.65, 1),
+        )
+        wrapper.add_widget(close_btn)
+        kwargs = {"title": title, "content": wrapper,
+                  "size_hint": (0.94, 0.80), "auto_dismiss": True}
         if CHINESE_FONT_PATH:
             kwargs["title_font"] = CHINESE_FONT_NAME
-        Popup(**kwargs).open()
+        popup = Popup(**kwargs)
+        close_btn.bind(on_release=popup.dismiss)
+        popup.open()
 
     def show_wrong_book(self, *_):
+        fresh = self.load_json(self.review_path, {})
+        if isinstance(fresh, dict):
+            self.review_schedule = fresh
         records = sorted(
             (item for item in self.review_schedule.values() if isinstance(item, dict) and int(item.get("wrong", 0)) > 0),
             key=lambda item: (item.get("due", "9999"), -int(item.get("wrong", 0))),
@@ -1061,6 +1229,228 @@ class VocabTrainer(BoxLayout):
         caption = f"错词共 {len(records)} 个（显示前 {min(len(records), 250)} 个）\n\n"
         self.show_report_popup("错题本", caption + "\n\n".join(text_rows))
 
+    # V1.4: card study, learning ratings, collection, searching and word details.
+    def all_vocabulary(self):
+        items = {}
+        for unit in self.sorted_unit_names():
+            for word in self.units[unit]:
+                items.setdefault(self.word_key(word), word)
+        return list(items.values())
+
+    def _favorite_keys(self):
+        values = self.load_json(self.favorites_path, [])
+        return set(values) if isinstance(values, list) else set()
+
+    def toggle_favorite(self, word, *_):
+        key = self.word_key(word)
+        favorites = self._favorite_keys()
+        if key in favorites:
+            favorites.remove(key)
+        else:
+            favorites.add(key)
+        self.save_json(self.favorites_path, sorted(favorites))
+        self.show_popup("收藏夹", f"{word.get('en', '')} 已{'收藏' if key in favorites else '取消收藏'}")
+
+    def _card_grade(self, word, rating, today=None):
+        """SM-2-inspired transparent intervals; independent of the old quiz schedule."""
+        today = today or date.today()
+        key = self.word_key(word)
+        cards = self.load_json(self.cards_path, {})
+        if not isinstance(cards, dict):
+            cards = {}
+        record = cards.get(key, {})
+        rep = int(record.get("repetitions", 0))
+        ease = max(1.3, float(record.get("ease", 2.5)))
+        interval = int(record.get("interval", 0))
+        if rating == "again":
+            rep = 0
+            interval = 0
+            ease = max(1.3, ease - 0.2)
+        elif rating == "hard":
+            rep = max(1, rep)
+            interval = max(1, round(interval * 1.2))
+            ease = max(1.3, ease - 0.15)
+        else:
+            rep += 1
+            interval = 1 if rep == 1 else (3 if rep == 2 else max(4, round(interval * ease)))
+            ease = min(3.0, ease + 0.05)
+        record.update({"word": word, "repetitions": rep, "ease": round(ease, 2),
+                       "interval": interval, "due": (today + timedelta(days=interval)).isoformat(),
+                       "last": today.isoformat(), "rating": rating})
+        cards[key] = record
+        self.save_json(self.cards_path, cards)
+        return record
+
+    def start_cards(self, mode="unit", *_):
+        pool = self.all_vocabulary() if mode != "unit" else list(self.units.get(self.selected_unit, []))
+        if mode == "favorites":
+            keys = self._favorite_keys()
+            pool = [w for w in pool if self.word_key(w) in keys]
+        elif mode == "due":
+            cards = self.load_json(self.cards_path, {})
+            today = date.today().isoformat()
+            pool = [w for w in pool if self.word_key(w) in cards and cards[self.word_key(w)].get("due", "9999") <= today]
+        if not pool:
+            self.show_popup("暂时没有单词", "当前没有符合条件的卡片，可以先学习或收藏单词。")
+            return
+        self.card_queue = list(pool[:100])
+        self.card_position = 0
+        self._show_next_card()
+
+    def _show_next_card(self):
+        if self.card_position >= len(self.card_queue):
+            self.active_tab = "home"
+            self.build_menu()
+            self.show_popup("卡片练习完成", "本次卡片已学完，熟悉度和复习日期已保存。")
+            return
+        self.card_current = self.card_queue[self.card_position]
+        self.card_revealed = False
+        self.clear()
+        word = self.card_current
+        scroll = ScrollView(do_scroll_x=False)
+        body = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(12), size_hint_y=None)
+        body.bind(minimum_height=body.setter("height"))
+        scroll.add_widget(body)
+        self.add_widget(scroll)
+        self._label(body, f"单词卡片   {self.card_position + 1} / {len(self.card_queue)}", 48, 21, bold=True)
+        pane = self._panel(body, pad=16)
+        self._label(pane, word.get("en", ""), 74, 32, bold=True, align="center")
+        detail = self.load_json(self.details_path, {}).get(self.word_key(word), {})
+        self._label(pane, detail.get("ipa", "") or "音标待补充", 34, 17, align="center")
+        self._action(pane, "播放英文发音", lambda *_: self.speak_word(word.get("en", "")), height=48)
+        self.card_meaning_label = self._label(pane, "点击下方按钮揭晓释义", 85, 18, align="center")
+        self.card_detail_label = self._label(pane, "", 100, 15, dark=False, align="center")
+        self._action(body, "翻开卡片 / 查看释义", self.reveal_card)
+        self._action(body, "收藏 / 取消收藏", lambda *_: self.toggle_favorite(word), color=(0.30, 0.43, 0.56, 1))
+        self._label(body, "回忆后选择熟悉程度", 34, 16)
+        buttons = BoxLayout(size_hint_y=None, height=dp(54), spacing=dp(6))
+        for label, rating, color in [("不认识", "again", (.74,.25,.23,1)),
+                                     ("模糊", "hard", (.75,.49,.18,1)),
+                                     ("认识", "good", (.12,.43,.35,1))]:
+            b = CNButton(text=label, background_normal="", background_color=color)
+            b.bind(on_release=lambda _, r=rating: self.rate_card(r))
+            buttons.add_widget(b)
+        body.add_widget(buttons)
+        self._action(body, "退出卡片学习", lambda *_: self.build_menu(), color=(.35,.42,.46,1))
+
+    def reveal_card(self, *_):
+        if not self.card_current:
+            return
+        word = self.card_current
+        self.card_revealed = True
+        self.card_meaning_label.text = f"{' / '.join(word.get('pos') or [])}\n{word.get('zh', '')}"
+        detail = self.load_json(self.details_path, {}).get(self.word_key(word), {})
+        self.card_detail_label.text = (f"词族：{word.get('family') or '暂无'}\n"
+                                       f"例句：{detail.get('example') or '暂无（可在单词详情中手动补充）'}")
+
+    def rate_card(self, rating):
+        if not self.card_current:
+            return
+        if not self.card_revealed:
+            self.reveal_card()
+            self.show_popup("先看答案", "已为你翻开卡片，请确认释义后再选择熟悉程度。")
+            return
+        self._card_grade(self.card_current, rating)
+        self.card_position += 1
+        self._show_next_card()
+
+    def show_word_search(self, *_):
+        wrapper = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
+        keyword = TextInput(hint_text="输入英文或中文搜索", multiline=False, size_hint_y=None, height=dp(50))
+        if CHINESE_FONT_PATH:
+            keyword.font_name = CHINESE_FONT_NAME
+        wrapper.add_widget(keyword)
+        results = TextInput(readonly=True, multiline=True, font_size=dp(16))
+        if CHINESE_FONT_PATH:
+            results.font_name = CHINESE_FONT_NAME
+        wrapper.add_widget(results)
+        actions = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
+        view_btn = CNButton(text="单词详情")
+        fav_btn = CNButton(text="收藏选中")
+        actions.add_widget(view_btn)
+        actions.add_widget(fav_btn)
+        wrapper.add_widget(actions)
+        items = self.all_vocabulary()
+        shown = []
+        def update(*_):
+            value = keyword.text.strip().lower()
+            shown[:] = [w for w in items if value in w.get('en','').lower() or value in w.get('zh','').lower()][:80] if value else []
+            results.text = "\n".join(f"{i+1}. {w.get('en')}  —  {w.get('zh')}" for i,w in enumerate(shown)) or "输入关键词后显示结果"
+        keyword.bind(text=update)
+        update()
+        kw = {"title":"搜索与收藏", "content":wrapper,"size_hint":(.94,.82)}
+        if CHINESE_FONT_PATH:
+            kw["title_font"] = CHINESE_FONT_NAME
+        popup = Popup(**kw)
+        def selected():
+            # 精确搜索时选择匹配单词；多结果默认列表第一条。
+            value = keyword.text.strip().lower()
+            return next((w for w in shown if w.get('en','').lower() == value), shown[0] if shown else None)
+        def details(*_):
+            word = selected()
+            if word:
+                popup.dismiss()
+                self.show_word_details(word)
+        def favorite(*_):
+            word = selected()
+            if word:
+                self.toggle_favorite(word)
+        view_btn.bind(on_release=details)
+        fav_btn.bind(on_release=favorite)
+        popup.open()
+
+    def show_word_details(self, word, *_):
+        key = self.word_key(word)
+        details = self.load_json(self.details_path, {})
+        existing = details.get(key, {})
+        wrapper = BoxLayout(orientation='vertical',padding=dp(10),spacing=dp(8))
+        title = CNLabel(text=f"{word.get('en','')}\n{word.get('zh','')}",size_hint_y=None,height=dp(86))
+        wrapper.add_widget(title)
+        ipa = TextInput(text=existing.get('ipa',''), hint_text='音标（可手动填写）',multiline=False,size_hint_y=None,height=dp(46))
+        example = TextInput(text=existing.get('example',''), hint_text='英语例句（可手动填写）',multiline=True)
+        if CHINESE_FONT_PATH:
+            ipa.font_name = example.font_name = CHINESE_FONT_NAME
+        wrapper.add_widget(ipa)
+        wrapper.add_widget(example)
+        self._label(wrapper, f"词族/关联词：{word.get('family') or '暂无'}",height=55,size=15)
+        buttons = BoxLayout(size_hint_y=None,height=dp(48),spacing=dp(8))
+        save = CNButton(text='保存详情'); play = CNButton(text='播放发音')
+        buttons.add_widget(save); buttons.add_widget(play)
+        wrapper.add_widget(buttons)
+        kw={"title":"单词详情", "content":wrapper,"size_hint":(.94,.75)}
+        if CHINESE_FONT_PATH:
+            kw['title_font']=CHINESE_FONT_NAME
+        popup=Popup(**kw)
+        def save_details(*_):
+            details[key]={"ipa":ipa.text.strip(),"example":example.text.strip()}
+            self.save_json(self.details_path, details)
+            popup.dismiss()
+            self.show_popup("已保存", "音标和例句已保存到本地，并包含在数据备份中。")
+        save.bind(on_release=save_details)
+        play.bind(on_release=lambda *_:self.speak_word(word.get('en','')))
+        popup.open()
+
+    def show_favorites(self, *_):
+        keys = self._favorite_keys()
+        words = [w for w in self.all_vocabulary() if self.word_key(w) in keys]
+        if not words:
+            self.show_popup('收藏夹', '还没有收藏。搜索单词或翻卡片时可添加收藏。')
+            return
+        self.show_report_popup('我的收藏夹', '\n'.join(f"{w['en']}  —  {w['zh']}" for w in words))
+
+    def show_calendar(self, *_):
+        activity = self.load_json(self.activity_path, {})
+        today = date.today()
+        lines = []
+        for i in range(27, -1, -1):
+            day = today - timedelta(days=i)
+            r = activity.get(day.isoformat(), {})
+            n = int(r.get('answered', 0)) if isinstance(r, dict) else 0
+            c = int(r.get('correct', 0)) if isinstance(r, dict) else 0
+            bar = '■' * min(12, math.ceil(n / 5)) if n else '·'
+            lines.append(f"{day.strftime('%m-%d')}  {bar}  {n}题  {c / n * 100 if n else 0:.0f}%")
+        self.show_report_popup('近28天学习日历与趋势', '\n'.join(lines))
+
     def start_quiz(self, *_):
         mode_map = {
             "单词听音四选一": "listening",
@@ -1068,17 +1458,17 @@ class VocabTrainer(BoxLayout):
             "词性判断": "pos",
             "综合测试": "mixed",
         }
-        self.quiz_mode = mode_map[self.mode_spinner.text]
-        self.order_mode = "sequential" if self.order_spinner.text.startswith("正序") else "shuffle"
+        self.quiz_mode = mode_map[self.ui_mode_text]
+        self.order_mode = "sequential" if self.ui_order_text.startswith("正序") else "shuffle"
         words = list(self.units.get(self.selected_unit, []))
         if len(words) < 4:
             self.show_popup("提示", "当前词库至少需要 4 个单词。")
             return
 
-        if self.count_spinner.text == "全部":
+        if self.ui_count_text == "全部":
             requested = len(words)
         else:
-            requested = int(re.search(r"\d+", self.count_spinner.text).group())
+            requested = int(re.search(r"\d+", self.ui_count_text).group())
 
         if self._advance_event is not None:
             self._advance_event.cancel()
