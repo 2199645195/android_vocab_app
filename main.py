@@ -8,7 +8,7 @@ import urllib.parse
 import urllib.request
 import ssl
 from urllib.error import HTTPError, URLError
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -413,6 +413,16 @@ class VocabTrainer(BoxLayout):
         self.wrong_path = os.path.join(self.data_dir, "wrong_words.jsonl")
         self.stats_path = os.path.join(self.data_dir, "stats.json")
         self.custom_units_path = os.path.join(self.data_dir, "custom_units.json")
+        self.review_path = os.path.join(self.data_dir, "review_schedule.json")
+        self.activity_path = os.path.join(self.data_dir, "study_activity.json")
+        self.review_mode = False
+        self._advance_event = None
+        self.session_words = set()
+        self.session_wrong = 0
+        self.review_schedule = self.load_json(self.review_path, {})
+        if not isinstance(self.review_schedule, dict):
+            self.review_schedule = {}
+        self._migrate_wrong_words()
         self.load_vocab()
         self.build_menu()
 
@@ -452,6 +462,11 @@ class VocabTrainer(BoxLayout):
 
     def build_menu(self, *_):
         self.clear()
+        scroller = ScrollView(do_scroll_x=False)
+        menu = BoxLayout(orientation="vertical", spacing=dp(10), padding=[dp(4), dp(4), dp(4), dp(18)], size_hint_y=None)
+        menu.bind(minimum_height=menu.setter("height"))
+        scroller.add_widget(menu)
+        self.add_widget(scroller)
         title = CNLabel(
             text="四级单词训练",
             font_size=dp(26),
@@ -460,7 +475,7 @@ class VocabTrainer(BoxLayout):
             height=dp(46),
             color=(0.08, 0.12, 0.18, 1),
         )
-        self.add_widget(title)
+        menu.add_widget(title)
 
         unit_names = self.sorted_unit_names()
         self.unit_spinner = CNSpinner(
@@ -471,7 +486,7 @@ class VocabTrainer(BoxLayout):
             background_color=(0.13, 0.45, 0.85, 1),
         )
         self.unit_spinner.bind(text=self.set_unit)
-        self.add_widget(self.unit_spinner)
+        menu.add_widget(self.unit_spinner)
 
         import_button = CNButton(
             text="📄 导入词库文件（TXT）",
@@ -481,7 +496,7 @@ class VocabTrainer(BoxLayout):
             background_color=(0.16, 0.48, 0.68, 1),
         )
         import_button.bind(on_release=self.import_vocab_file)
-        self.add_widget(import_button)
+        menu.add_widget(import_button)
 
         add_unit_button = CNButton(
             text="＋ 手动添加单元 / 单词",
@@ -491,7 +506,7 @@ class VocabTrainer(BoxLayout):
             background_color=(0.20, 0.38, 0.62, 1),
         )
         add_unit_button.bind(on_release=self.show_add_unit_popup)
-        self.add_widget(add_unit_button)
+        menu.add_widget(add_unit_button)
 
         self.mode_spinner = CNSpinner(
             text="单词听音四选一",
@@ -499,7 +514,7 @@ class VocabTrainer(BoxLayout):
             size_hint_y=None,
             height=dp(46),
         )
-        self.add_widget(self.mode_spinner)
+        menu.add_widget(self.mode_spinner)
 
         self.order_spinner = CNSpinner(
             text="正序自动记录进度",
@@ -507,7 +522,7 @@ class VocabTrainer(BoxLayout):
             size_hint_y=None,
             height=dp(46),
         )
-        self.add_widget(self.order_spinner)
+        menu.add_widget(self.order_spinner)
 
         self.count_spinner = CNSpinner(
             text="每天 25 个",
@@ -515,7 +530,7 @@ class VocabTrainer(BoxLayout):
             size_hint_y=None,
             height=dp(46),
         )
-        self.add_widget(self.count_spinner)
+        menu.add_widget(self.count_spinner)
 
         progress = self.load_progress()
         preview_key = self.make_progress_key(self.selected_unit, "listening")
@@ -529,7 +544,7 @@ class VocabTrainer(BoxLayout):
             color=(0.2, 0.25, 0.32, 1),
         )
         self.menu_info.bind(size=lambda label, size: setattr(label, "text_size", size))
-        self.add_widget(self.menu_info)
+        menu.add_widget(self.menu_info)
 
         start_button = CNButton(
             text="开始",
@@ -540,11 +555,34 @@ class VocabTrainer(BoxLayout):
             background_color=(0.12, 0.62, 0.36, 1),
         )
         start_button.bind(on_release=self.start_quiz)
-        self.add_widget(start_button)
+        menu.add_widget(start_button)
 
         wrong_button = CNButton(text="查看错题数量", size_hint_y=None, height=dp(44))
         wrong_button.bind(on_release=self.show_wrong_count)
-        self.add_widget(wrong_button)
+        menu.add_widget(wrong_button)
+
+        due = len(self.get_due_words())
+        review_button = CNButton(
+            text=f"今日待复习：{due} 词  |  开始自动复习",
+            font_size=dp(17), size_hint_y=None, height=dp(50),
+            background_color=(0.73, 0.37, 0.13, 1),
+        )
+        review_button.bind(on_release=self.start_review)
+        menu.add_widget(review_button)
+
+        dashboard_button = CNButton(
+            text="学习进度 · 每日统计 · 错题本",
+            font_size=dp(17), size_hint_y=None, height=dp(48),
+            background_color=(0.16, 0.43, 0.56, 1),
+        )
+        dashboard_button.bind(on_release=self.show_dashboard)
+        menu.add_widget(dashboard_button)
+
+        wrongbook_button = CNButton(
+            text="打开错题本 · 查看单词详情", size_hint_y=None, height=dp(46)
+        )
+        wrongbook_button.bind(on_release=self.show_wrong_book)
+        menu.add_widget(wrongbook_button)
 
     def set_unit(self, _spinner, value):
         self.selected_unit = value
@@ -815,8 +853,10 @@ class VocabTrainer(BoxLayout):
             return default
 
     def save_json(self, path, data):
-        with open(path, "w", encoding="utf-8") as json_file:
+        temp = path + ".tmp"
+        with open(temp, "w", encoding="utf-8") as json_file:
             json.dump(data, json_file, ensure_ascii=False, indent=2)
+        os.replace(temp, path)
 
     def load_progress(self):
         return self.load_json(self.progress_path, {})
@@ -825,6 +865,201 @@ class VocabTrainer(BoxLayout):
         data = self.load_progress()
         data[key] = index
         self.save_json(self.progress_path, data)
+
+    @staticmethod
+    def word_key(word):
+        return re.sub(r"\s+", " ", str(word.get("en", "")).strip().lower())
+
+    def _migrate_wrong_words(self):
+        """旧版 jsonl 只读迁移，不删除用户数据。"""
+        if not os.path.exists(self.wrong_path):
+            return
+        changed = False
+        try:
+            with open(self.wrong_path, "r", encoding="utf-8") as fp:
+                for raw in fp:
+                    try:
+                        word = json.loads(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(word, dict):
+                        continue
+                    key = self.word_key(word)
+                    if key and key not in self.review_schedule:
+                        self.review_schedule[key] = {
+                            "word": {k: word.get(k) for k in ("en", "zh", "pos", "family")},
+                            "wrong": 1, "correct": 0, "streak": 0, "level": 0,
+                            "due": date.today().isoformat(), "last": "", "last_wrong": True,
+                        }
+                        changed = True
+        except OSError:
+            return
+        if changed:
+            self._save_review_schedule()
+
+    def _save_review_schedule(self):
+        self.save_json(self.review_path, self.review_schedule)
+
+    def get_due_words(self):
+        today = date.today().isoformat()
+        return [item["word"] for item in self.review_schedule.values()
+                if isinstance(item, dict) and item.get("due", "9999") <= today
+                and isinstance(item.get("word"), dict) and item["word"].get("en")]
+
+    def record_answer(self, word, is_correct):
+        key = self.word_key(word)
+        if not key:
+            return
+        today = date.today()
+        record = self.review_schedule.get(key, {})
+        record["word"] = {k: word.get(k) for k in ("en", "zh", "pos", "family")}
+        record["correct"] = int(record.get("correct", 0)) + int(is_correct)
+        record["wrong"] = int(record.get("wrong", 0)) + int(not is_correct)
+        record["last"] = today.isoformat()
+        record["last_wrong"] = not is_correct
+        if is_correct:
+            streak = int(record.get("streak", 0)) + 1
+            record["streak"] = streak
+            level = min(6, int(record.get("level", 0)) + 1)
+            record["level"] = level
+            # 简单透明的间隔复习：1、3、7、14、30、60 天。
+            days = (1, 3, 7, 14, 30, 60)[level - 1]
+            record["due"] = (today + timedelta(days=days)).isoformat()
+        else:
+            record["streak"] = 0
+            record["level"] = 0
+            # 当天继续复习错词；下次开始复习将自动出现。
+            record["due"] = today.isoformat()
+        self.review_schedule[key] = record
+        self._save_review_schedule()
+
+        activity = self.load_json(self.activity_path, {})
+        if not isinstance(activity, dict):
+            activity = {}
+        daily = activity.setdefault(today.isoformat(), {"answered": 0, "correct": 0, "wrong": 0, "unique": []})
+        daily["answered"] = int(daily.get("answered", 0)) + 1
+        daily["correct"] = int(daily.get("correct", 0)) + int(is_correct)
+        daily["wrong"] = int(daily.get("wrong", 0)) + int(not is_correct)
+        unique = daily.get("unique", [])
+        if not isinstance(unique, list):
+            unique = []
+        if key not in unique:
+            unique.append(key)
+        daily["unique"] = unique
+        self.save_json(self.activity_path, activity)
+        self.session_words.add(key)
+        self.session_wrong += int(not is_correct)
+
+    def start_review(self, *_):
+        due = self.get_due_words()
+        if not due:
+            self.show_popup("复习完成", "目前没有到期的复习单词。\n继续正常练习，系统会按你的答题情况安排下次复习。")
+            return
+        # 错词可能来自多个单元；从完整词库补充干扰项。
+        vocabulary = {}
+        for words in self.units.values():
+            for word in words:
+                vocabulary[self.word_key(word)] = word
+        for word in due:
+            vocabulary[self.word_key(word)] = word
+        self.all_words = list(vocabulary.values())
+        if len(self.all_words) < 4:
+            self.show_popup("无法开始", "至少需要 4 个不同单词才能生成四选一练习。")
+            return
+        if self._advance_event is not None:
+            self._advance_event.cancel()
+            self._advance_event = None
+        self.review_mode = True
+        self.quiz_mode = "mixed"
+        self.order_mode = "shuffle"
+        self.sequential_key = None
+        self.total_answered = self.score = self.listening_total = self.listening_correct = 0
+        self.session_wrong = 0
+        self.session_words = set()
+        # 一次复习上限 25 词，避免课程过长。
+        self.test_pool = due[:25]
+        random.shuffle(self.test_pool)
+        self.total_questions = len(self.test_pool)
+        self.build_quiz_ui()
+        self.next_question()
+
+    def show_dashboard(self, *_):
+        activity = self.load_json(self.activity_path, {})
+        if not isinstance(activity, dict):
+            activity = {}
+        today = date.today().isoformat()
+        td = activity.get(today, {})
+        answered = sum(int(day.get("answered", 0)) for day in activity.values() if isinstance(day, dict))
+        correct = sum(int(day.get("correct", 0)) for day in activity.values() if isinstance(day, dict))
+        unique_all = set()
+        for day in activity.values():
+            if isinstance(day, dict):
+                unique_all.update(day.get("unique", []))
+        due = len(self.get_due_words())
+        ever_wrong = [r for r in self.review_schedule.values() if int(r.get("wrong", 0)) > 0]
+        mastered = sum(1 for r in self.review_schedule.values() if int(r.get("level", 0)) >= 4)
+        total_vocab = len({self.word_key(w) for words in self.units.values() for w in words})
+        streak = 0
+        cursor = date.today()
+        while activity.get(cursor.isoformat(), {}).get("answered", 0):
+            streak += 1
+            cursor -= timedelta(days=1)
+        if not streak:
+            cursor = date.today() - timedelta(days=1)
+            while activity.get(cursor.isoformat(), {}).get("answered", 0):
+                streak += 1
+                cursor -= timedelta(days=1)
+        daily_acc = (int(td.get("correct", 0)) / int(td.get("answered", 1)) * 100) if td.get("answered") else 0
+        report = (
+            f"今天答题：{td.get('answered', 0)} 题 | 答对 {td.get('correct', 0)} 题\n"
+            f"今日正确率：{daily_acc:.1f}%  | 今日不同单词：{len(td.get('unique', []))}\n"
+            f"连续学习：{streak} 天\n\n"
+            f"累计答题：{answered} 题 | 总正确率：{correct / answered * 100 if answered else 0:.1f}%\n"
+            f"累计练过：{len(unique_all)} / {total_vocab} 个不同单词\n"
+            f"已达到强化掌握等级：{mastered} 个\n"
+            f"历史错词：{len(ever_wrong)} 个 | 今日待复习：{due} 个\n\n"
+            "复习间隔：1→3→7→14→30→60 天；答错归零。"
+        )
+        self.show_report_popup("学习进度与复习报告", report)
+
+    def show_report_popup(self, title, report):
+        scroll = ScrollView(do_scroll_x=False)
+        content = CNLabel(
+            text=report,
+            font_size=dp(15),
+            halign="left", valign="top",
+            size_hint_y=None,
+            padding=[dp(12), dp(12)],
+            color=(0.12, 0.16, 0.22, 1),
+        )
+        content.bind(width=lambda obj, width: setattr(obj, "text_size", (max(width - dp(24), 1), None)))
+        content.bind(texture_size=lambda obj, value: setattr(obj, "height", max(dp(140), value[1] + dp(30))))
+        scroll.add_widget(content)
+        kwargs = {"title": title, "content": scroll, "size_hint": (0.93, 0.73)}
+        if CHINESE_FONT_PATH:
+            kwargs["title_font"] = CHINESE_FONT_NAME
+        Popup(**kwargs).open()
+
+    def show_wrong_book(self, *_):
+        records = sorted(
+            (item for item in self.review_schedule.values() if isinstance(item, dict) and int(item.get("wrong", 0)) > 0),
+            key=lambda item: (item.get("due", "9999"), -int(item.get("wrong", 0))),
+        )
+        if not records:
+            self.show_popup("错题本", "还没有错题。答错的单词会自动记录在这里。")
+            return
+        text_rows = []
+        today = date.today().isoformat()
+        for item in records[:250]:
+            word = item.get("word", {})
+            due = item.get("due", "")
+            state = "待复习" if due <= today else "下次复习 " + due
+            text_rows.append(
+                f"{word.get('en', '')}  |  {word.get('zh', '')}\n"
+                f"答错 {item.get('wrong', 0)} 次 · 连续答对 {item.get('streak', 0)} 次 · {state}"
+            )
+        caption = f"错词共 {len(records)} 个（显示前 {min(len(records), 250)} 个）\n\n"
+        self.show_report_popup("错题本", caption + "\n\n".join(text_rows))
 
     def start_quiz(self, *_):
         mode_map = {
@@ -845,6 +1080,12 @@ class VocabTrainer(BoxLayout):
         else:
             requested = int(re.search(r"\d+", self.count_spinner.text).group())
 
+        if self._advance_event is not None:
+            self._advance_event.cancel()
+            self._advance_event = None
+        self.review_mode = False
+        self.session_words = set()
+        self.session_wrong = 0
         self.all_words = words
         self.total_answered = 0
         self.score = 0
@@ -926,6 +1167,7 @@ class VocabTrainer(BoxLayout):
         self.add_widget(bottom)
 
     def next_question(self, *_):
+        self._advance_event = None
         if not self.test_pool:
             self.end_test()
             return
@@ -1035,6 +1277,7 @@ class VocabTrainer(BoxLayout):
         if self.current_word.get("family"):
             detail += f"\n关联：{self.current_word['family']}"
 
+        self.record_answer(self.current_word, is_correct)
         if is_correct:
             self.score += 1
             if self.type_label.text == "单词听音四选一":
@@ -1042,7 +1285,7 @@ class VocabTrainer(BoxLayout):
             self.feedback_label.text = f"答对了\n{detail}"
             self.feedback_label.color = (0.1, 0.55, 0.32, 1)
             self.score_label.text = f"答对：{self.score}"
-            Clock.schedule_once(lambda *_: self.next_question(), 0.75)
+            self._advance_event = Clock.schedule_once(lambda *_: self.next_question(), 0.75)
         else:
             self.option_buttons[idx].background_color = (0.9, 0.18, 0.2, 1)
             self.option_buttons[idx].color = (1, 1, 1, 1)
@@ -1102,12 +1345,18 @@ class VocabTrainer(BoxLayout):
         self.show_popup("学习记录", f"累计错题：{len(wrong)}\n听音错题：{listening}\n释义错题：{meaning}\n词性错题：{pos}\n\n听音正确率：{acc}")
 
     def end_test(self, *_):
+        if self._advance_event is not None:
+            self._advance_event.cancel()
+            self._advance_event = None
         if self.total_answered == 0:
             self.build_menu()
             return
         acc = self.score / self.total_answered * 100
-        message = f"本次完成：{self.total_answered} 个\n答对：{self.score} 个\n正确率：{acc:.1f}%"
-        if self.order_mode == "sequential" and self.sequential_key:
+        message = (f"本次完成：{self.total_answered} 题\n答对：{self.score} 题\n"
+                   f"正确率：{acc:.1f}%\n错题：{self.session_wrong} 题\n"
+                   f"涉及单词：{len(self.session_words)} 个\n"
+                   f"当前待复习：{len(self.get_due_words())} 个")
+        if self.order_mode == "sequential" and self.sequential_key and not self.review_mode:
             if self.sequential_cursor >= len(self.all_words):
                 message += "\n\n本单元正序已学完，下次会从第 1 个词重新开始。"
             else:
