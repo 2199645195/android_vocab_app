@@ -391,6 +391,116 @@ class CachedWordAudio:
         self._stop_player()
 
 
+class WordInfoFetcher:
+    """Best effort metadata lookup. Never changes the established audio downloader.
+
+    All external data is untrusted; UI calls are delegated to Kivy's main thread.
+    """
+    def __init__(self, callback):
+        self.callback = callback
+        self.pending = set()
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _safe_text(value, limit=350):
+        return str(value or "").strip()[:limit]
+
+    @staticmethod
+    def _youdao_json(doc):
+        result = {}
+        ec = doc.get("ec") or {}
+        words = ec.get("word") or []
+        if isinstance(words, list) and words:
+            data = words[0] if isinstance(words[0], dict) else {}
+            phonetic = data.get("usphone") or data.get("ukphone") or data.get("phone")
+            if phonetic:
+                result["ipa"] = WordInfoFetcher._safe_text(phonetic, 90)
+        example_blocks = doc.get("blng_sents_part") or {}
+        sentences = example_blocks.get("sentence-pair") or [] if isinstance(example_blocks, dict) else []
+        if isinstance(sentences, list):
+            for item in sentences:
+                if isinstance(item, dict):
+                    text = re.sub(r'<[^>]*>', '', str(item.get('sentence-eng') or '')).strip()
+                    if text and len(text) < 350:
+                        result['example'] = text
+                        translation = re.sub(r'<[^>]*>', '', str(item.get('sentence-translation') or '')).strip()
+                        if translation: result['example_zh'] = translation[:350]
+                        break
+        phrase_blocks = doc.get('phrs') or {}
+        phrases = phrase_blocks.get('phrs') or [] if isinstance(phrase_blocks, dict) else []
+        if isinstance(phrases, list):
+            values = []
+            for item in phrases[:4]:
+                if not isinstance(item, dict): continue
+                head = item.get('headword') or {}
+                if isinstance(head, dict) and head.get('l', {}).get('i'):
+                    candidate = head['l']['i']
+                    if isinstance(candidate, str): values.append(candidate[:100])
+            if values: result['phrases'] = '；'.join(values)
+        return result
+
+    @staticmethod
+    def _dictionary_json(doc):
+        if not isinstance(doc, list) or not doc or not isinstance(doc[0], dict): return {}
+        entry = doc[0]; result = {}
+        for phon in entry.get('phonetics', []):
+            if isinstance(phon, dict) and phon.get('text'):
+                result['ipa'] = WordInfoFetcher._safe_text(phon['text'], 90)
+                break
+        if not result.get('ipa') and entry.get('phonetic'):
+            result['ipa'] = WordInfoFetcher._safe_text(entry['phonetic'], 90)
+        for meaning in entry.get('meanings', []):
+            if not isinstance(meaning, dict): continue
+            for definition in meaning.get('definitions', []):
+                example = definition.get('example') if isinstance(definition, dict) else None
+                if example:
+                    result['example'] = WordInfoFetcher._safe_text(example)
+                    return result
+        return result
+
+    def request(self, word):
+        key = word.strip().lower()
+        if not re.fullmatch(r"[a-z][a-z '\-]{0,65}", key):
+            self.callback(key, {}, '当前词条不适合自动查询，可手动补充')
+            return
+        with self.lock:
+            if key in self.pending: return
+            self.pending.add(key)
+        threading.Thread(target=self._worker, args=(key,), daemon=True).start()
+
+    def _worker(self, word):
+        result = {}; errors=[]
+        urls = [
+            ('有道', 'https://dict.youdao.com/jsonapi?q='+urllib.parse.quote(word), self._youdao_json),
+            ('开放词典', 'https://api.dictionaryapi.dev/api/v2/entries/en/'+urllib.parse.quote(word), self._dictionary_json),
+        ]
+        try:
+            import certifi
+            context = ssl.create_default_context(cafile=certifi.where())
+            for name, url, parser in urls:
+                try:
+                    request = urllib.request.Request(url, headers={
+                        'User-Agent':'Mozilla/5.0 VocabularyTrainer/1.6',
+                        'Accept':'application/json',
+                    })
+                    with urllib.request.urlopen(request, timeout=7, context=context) as response:
+                        if int(response.status) != 200: raise OSError('HTTP '+str(response.status))
+                        payload = response.read(1024*1024+1)
+                        if len(payload)>1024*1024: raise ValueError('JSON响应过大')
+                    parsed = parser(json.loads(payload.decode('utf-8-sig')))
+                    for field in ('ipa','example','example_zh','phrases'):
+                        if parsed.get(field) and not result.get(field): result[field]=parsed[field]
+                    if result.get('ipa') and result.get('example'): break
+                except Exception as exc:
+                    errors.append(name+': '+type(exc).__name__)
+        except Exception as exc:
+            errors.append('证书设置: '+type(exc).__name__)
+        finally:
+            with self.lock: self.pending.discard(word)
+            message = '；'.join(errors) if not result else ''
+            Clock.schedule_once(lambda _dt, k=word, r=result, m=message: self.callback(k,r,m), 0)
+
+
 class VocabTrainer(BoxLayout):
     current_word = ObjectProperty(None, allownone=True)
     current_options = ListProperty([])
@@ -424,6 +534,8 @@ class VocabTrainer(BoxLayout):
         self.favorites_path = os.path.join(self.data_dir, "favorites.json")
         self.cards_path = os.path.join(self.data_dir, "card_schedule.json")
         self.details_path = os.path.join(self.data_dir, "word_details.json")
+        self.word_info_fetcher = WordInfoFetcher(self._on_word_info_result)
+        self.settings_path = os.path.join(self.data_dir, "learning_settings.json")
         self.card_queue = []
         self.card_current = None
         self.card_revealed = False
@@ -433,6 +545,19 @@ class VocabTrainer(BoxLayout):
         self.ui_mode_text = "单词听音四选一"
         self.ui_order_text = "正序自动记录进度"
         self.ui_count_text = "每天 25 个"
+        saved_settings = self.load_json(self.settings_path, {})
+        if isinstance(saved_settings, dict):
+            allowed = {
+                "mode": ["单词听音四选一", "中文释义", "词性判断", "综合测试"],
+                "order": ["正序自动记录进度", "乱序随机练习"],
+                "count": ["每天 10 个", "每天 15 个", "每天 20 个", "每天 25 个", "每天 30 个", "全部"],
+            }
+            if saved_settings.get("mode") in allowed["mode"]:
+                self.ui_mode_text = saved_settings["mode"]
+            if saved_settings.get("order") in allowed["order"]:
+                self.ui_order_text = saved_settings["order"]
+            if saved_settings.get("count") in allowed["count"]:
+                self.ui_count_text = saved_settings["count"]
         self.active_tab = "home"
         self._advance_event = None
         self.session_words = set()
@@ -514,6 +639,22 @@ class VocabTrainer(BoxLayout):
         parent.add_widget(spin)
         return spin
 
+    def _save_learning_settings(self):
+        self.save_json(self.settings_path, {
+            "mode": self.ui_mode_text, "order": self.ui_order_text,
+            "count": self.ui_count_text,
+        })
+
+    def _set_learning_setting(self, attribute, value):
+        setattr(self, attribute, value)
+        self._save_learning_settings()
+
+    def card_due_count(self):
+        cards = self.load_json(self.cards_path, {})
+        today = date.today().isoformat()
+        return sum(1 for record in cards.values()
+                   if isinstance(record, dict) and record.get('due', '9999') <= today) if isinstance(cards, dict) else 0
+
     def _change_tab(self, tab):
         self.active_tab = tab
         self.build_menu()
@@ -561,6 +702,8 @@ class VocabTrainer(BoxLayout):
             self._action(actions,"开始学习",self.start_quiz,height=57)
             self._action(actions,"单词卡片 · 认识/模糊/不认识",lambda *_:self.start_cards('unit'),color=(.22,.39,.57,1))
             self._action(actions,f"智能复习 · {len(self.get_due_words())} 词",self.start_review,color=(0.72,0.45,0.18,1),height=57)
+            self._action(actions, f"到期卡片复习 · {self.card_due_count()} 词",
+                         lambda *_: self.start_cards('due'), color=(.24,.43,.54,1))
             self._label(actions,"练习模式和每日数量可在底部「设置」调整",size=12,dark=False,height=25)
         elif self.active_tab == "library":
             panel=self._panel(body)
@@ -580,7 +723,7 @@ class VocabTrainer(BoxLayout):
             self._label(panel,f"到期复习  {len(self.get_due_words())} 个",height=38,size=18)
             self._action(panel,"查看具体错词与错误次数",self.show_wrong_book)
             self._action(panel,"开始到期复习",self.start_review,color=(0.72,0.45,0.18,1))
-            self._action(panel,"到期记忆卡片复习",lambda *_:self.start_cards('due'))
+            self._action(panel,f"到期记忆卡片 · {self.card_due_count()} 词",lambda *_:self.start_cards('due'))
             self._action(panel,"查看旧版错题分类",self.show_wrong_count,color=(0.34,0.43,0.47,1))
         elif self.active_tab == "stats":
             activity=self.load_json(self.activity_path,{})
@@ -595,17 +738,18 @@ class VocabTrainer(BoxLayout):
             self._label(panel,f"今日正确率    {correct / answered * 100 if answered else 0:.1f}%",height=44,size=20)
             self._action(panel,"查看完整学习统计报告",self.show_dashboard)
             self._action(panel,"近28天学习日历与趋势",self.show_calendar)
+            self._label(panel,f"待复习单词卡片：{self.card_due_count()} 词",size=17,height=40)
         elif self.active_tab == "settings":
             panel=self._panel(body)
             self._label(panel,"练习模式",bold=True)
             self.mode_spinner=self._spinner(panel,self.ui_mode_text,["单词听音四选一","中文释义","词性判断","综合测试"],
-                    lambda obj,val:setattr(self,'ui_mode_text',val))
+                    lambda obj,val:self._set_learning_setting('ui_mode_text',val))
             self._label(panel,"单词顺序",bold=True)
             self.order_spinner=self._spinner(panel,self.ui_order_text,["正序自动记录进度","乱序随机练习"],
-                    lambda obj,val:setattr(self,'ui_order_text',val))
+                    lambda obj,val:self._set_learning_setting('ui_order_text',val))
             self._label(panel,"每次练习数量",bold=True)
             self.count_spinner=self._spinner(panel,self.ui_count_text,["每天 10 个","每天 15 个","每天 20 个","每天 25 个","每天 30 个","全部"],
-                    lambda obj,val:setattr(self,'ui_count_text',val))
+                    lambda obj,val:self._set_learning_setting('ui_count_text',val))
             self._label(panel,"更改后返回首页点击「开始学习」即会生效",size=13,dark=False,height=45)
             self._label(panel,"数据安全与备份",bold=True)
             self._action(panel,"导出学习记录 ZIP 备份",lambda *_:self._launch_saf('export_backup'))
@@ -760,7 +904,7 @@ class VocabTrainer(BoxLayout):
     def create_backup_bytes(self):
         names = ["progress.json", "wrong_words.jsonl", "stats.json", "custom_units.json",
                  "review_schedule.json", "study_activity.json", "favorites.json",
-                 "card_schedule.json", "word_details.json"]
+                 "card_schedule.json", "word_details.json", "learning_settings.json"]
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("manifest.json", json.dumps({"format": "vocabtrainer-v14", "created": datetime.now().isoformat(), "files": names}))
@@ -774,7 +918,7 @@ class VocabTrainer(BoxLayout):
         """Validate entire ZIP before touching any user files; never restore arbitrary paths."""
         allowed = {"progress.json", "wrong_words.jsonl", "stats.json", "custom_units.json",
                    "review_schedule.json", "study_activity.json", "favorites.json",
-                   "card_schedule.json", "word_details.json"}
+                   "card_schedule.json", "word_details.json", "learning_settings.json"}
         try:
             if len(payload) > 25 * 1024 * 1024:
                 raise ValueError("ZIP 体积过大")
@@ -803,6 +947,15 @@ class VocabTrainer(BoxLayout):
                     fp.write(content)
                 os.replace(tmp, dest)
             self.review_schedule = self.load_json(self.review_path, {})
+            saved = self.load_json(self.settings_path, {})
+            if isinstance(saved, dict):
+                for field, attr, choices in (
+                    ('mode', 'ui_mode_text', ['单词听音四选一', '中文释义', '词性判断', '综合测试']),
+                    ('order', 'ui_order_text', ['正序自动记录进度', '乱序随机练习']),
+                    ('count', 'ui_count_text', ['每天 10 个', '每天 15 个', '每天 20 个', '每天 25 个', '每天 30 个', '全部']),
+                ):
+                    if saved.get(field) in choices:
+                        setattr(self, attr, saved[field])
             self.load_vocab()
             self.build_menu()
             self.show_popup("恢复成功", f"已恢复 {len(pending)} 项数据。\n不会覆盖现有 MP3 缓存。")
@@ -1294,6 +1447,7 @@ class VocabTrainer(BoxLayout):
             self.show_popup("暂时没有单词", "当前没有符合条件的卡片，可以先学习或收藏单词。")
             return
         self.card_queue = list(pool[:100])
+        self.card_attempts = {}
         self.card_position = 0
         self._show_next_card()
 
@@ -1315,8 +1469,11 @@ class VocabTrainer(BoxLayout):
         self._label(body, f"单词卡片   {self.card_position + 1} / {len(self.card_queue)}", 48, 21, bold=True)
         pane = self._panel(body, pad=16)
         self._label(pane, word.get("en", ""), 74, 32, bold=True, align="center")
-        detail = self.load_json(self.details_path, {}).get(self.word_key(word), {})
-        self._label(pane, detail.get("ipa", "") or "音标待补充", 34, 17, align="center")
+        detail_map = self.load_json(self.details_path, {})
+        detail = detail_map.get(self.word_key(word), {}) if isinstance(detail_map, dict) else {}
+        self.card_ipa_label = self._label(pane, detail.get("ipa", "") or "音标待补充", 34, 17, align="center")
+        if not detail.get("ipa") or not detail.get("example"):
+            self.fetch_word_info(word)
         self._action(pane, "播放英文发音", lambda *_: self.speak_word(word.get("en", "")), height=48)
         self.card_meaning_label = self._label(pane, "点击下方按钮揭晓释义", 85, 18, align="center")
         self.card_detail_label = self._label(pane, "", 100, 15, dark=False, align="center")
@@ -1339,9 +1496,11 @@ class VocabTrainer(BoxLayout):
         word = self.card_current
         self.card_revealed = True
         self.card_meaning_label.text = f"{' / '.join(word.get('pos') or [])}\n{word.get('zh', '')}"
-        detail = self.load_json(self.details_path, {}).get(self.word_key(word), {})
+        detail_map = self.load_json(self.details_path, {})
+        detail = detail_map.get(self.word_key(word), {}) if isinstance(detail_map, dict) else {}
         self.card_detail_label.text = (f"词族：{word.get('family') or '暂无'}\n"
-                                       f"例句：{detail.get('example') or '暂无（可在单词详情中手动补充）'}")
+                                       f"例句：{detail.get('example') or '暂无（可在单词详情中手动补充）'}\n"
+                                       f"短语：{detail.get('phrases') or '暂无'}")
 
     def rate_card(self, rating):
         if not self.card_current:
@@ -1350,47 +1509,76 @@ class VocabTrainer(BoxLayout):
             self.reveal_card()
             self.show_popup("先看答案", "已为你翻开卡片，请确认释义后再选择熟悉程度。")
             return
-        self._card_grade(self.card_current, rating)
+        word = self.card_current
+        key = self.word_key(word)
+        self._card_grade(word, rating)
+        # 不认识的卡片在本轮末尾再出现一次，最多额外出现两次，避免无限循环。
+        attempts = self.card_attempts.get(key, 0)
+        if rating == 'again' and attempts < 2:
+            self.card_attempts[key] = attempts + 1
+            self.card_queue.append(word)
         self.card_position += 1
         self._show_next_card()
 
     def show_word_search(self, *_):
+        """显式选择搜索结果，避免多结果时误收藏第一项。"""
         wrapper = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10))
-        keyword = TextInput(hint_text="输入英文或中文搜索", multiline=False, size_hint_y=None, height=dp(50))
+        keyword = TextInput(hint_text="输入英文或中文搜索", multiline=False,
+                            size_hint_y=None, height=dp(48))
         if CHINESE_FONT_PATH:
             keyword.font_name = CHINESE_FONT_NAME
         wrapper.add_widget(keyword)
-        results = TextInput(readonly=True, multiline=True, font_size=dp(16))
+        results_note = CNLabel(text="输入关键词进行搜索", size_hint_y=None,
+                               height=dp(40), color=(.27,.36,.39,1))
+        wrapper.add_widget(results_note)
+        choose = CNSpinner(text="请先搜索并选择单词", values=[],
+                           size_hint_y=None, height=dp(52))
+        wrapper.add_widget(choose)
+        display = TextInput(readonly=True, multiline=True, font_size=dp(15))
         if CHINESE_FONT_PATH:
-            results.font_name = CHINESE_FONT_NAME
-        wrapper.add_widget(results)
+            display.font_name = CHINESE_FONT_NAME
+        wrapper.add_widget(display)
         actions = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
         view_btn = CNButton(text="单词详情")
-        fav_btn = CNButton(text="收藏选中")
+        fav_btn = CNButton(text="收藏 / 取消收藏")
         actions.add_widget(view_btn)
         actions.add_widget(fav_btn)
         wrapper.add_widget(actions)
         items = self.all_vocabulary()
-        shown = []
+        found = []
+        labels = {}
+
         def update(*_):
             value = keyword.text.strip().lower()
-            shown[:] = [w for w in items if value in w.get('en','').lower() or value in w.get('zh','').lower()][:80] if value else []
-            results.text = "\n".join(f"{i+1}. {w.get('en')}  —  {w.get('zh')}" for i,w in enumerate(shown)) or "输入关键词后显示结果"
+            found[:] = ([w for w in items if value in w.get('en','').lower()
+                         or value in w.get('zh','').lower()][:80] if value else [])
+            labels.clear()
+            for index, w in enumerate(found):
+                label = f"{index+1}. {w.get('en','')} — {w.get('zh','')[:25]}"
+                labels[label] = w
+            choose.values = list(labels)
+            choose.text = '请选择搜索结果' if labels else '没有匹配单词'
+            results_note.text = f"找到 {len(found)} 个结果（最多显示80个）" if value else "输入关键词进行搜索"
+            display.text = "\n".join(labels) if found else "请输入关键词或更换搜索词"
         keyword.bind(text=update)
         update()
-        kw = {"title":"搜索与收藏", "content":wrapper,"size_hint":(.94,.82)}
+        kw = {"title":"搜索与收藏", "content":wrapper, "size_hint":(.94,.82)}
         if CHINESE_FONT_PATH:
             kw["title_font"] = CHINESE_FONT_NAME
         popup = Popup(**kw)
+
         def selected():
-            # 精确搜索时选择匹配单词；多结果默认列表第一条。
-            value = keyword.text.strip().lower()
-            return next((w for w in shown if w.get('en','').lower() == value), shown[0] if shown else None)
+            word = labels.get(choose.text)
+            if word is None:
+                self.show_popup("请选择单词", "请先从下拉框明确选中一个搜索结果。")
+            return word
+
         def details(*_):
             word = selected()
             if word:
                 popup.dismiss()
                 self.show_word_details(word)
+
         def favorite(*_):
             word = selected()
             if word:
@@ -1399,36 +1587,99 @@ class VocabTrainer(BoxLayout):
         fav_btn.bind(on_release=favorite)
         popup.open()
 
+    def _on_word_info_result(self, key, incoming, error):
+        """Merge only missing fields so manual edits are never overwritten."""
+        all_details = self.load_json(self.details_path,{})
+        if not isinstance(all_details, dict): all_details = {}
+        current = all_details.get(key,{})
+        if not isinstance(current, dict): current = {}
+        for field in ('ipa','example','example_zh','phrases'):
+            if incoming.get(field) and not current.get(field):
+                current[field] = incoming[field]
+        if incoming:
+            current['source'] = '网络词典（请自行核对）'
+            all_details[key]=current
+            self.save_json(self.details_path,all_details)
+        if getattr(self,'detail_popup_key',None)==key and getattr(self,'detail_popup',None):
+            for field, widget in getattr(self,'detail_inputs',{}).items():
+                if not widget.text.strip() and current.get(field): widget.text=current[field]
+            self.detail_status.text = ('已获取词典资料，可编辑并保存' if incoming else
+                                      '暂未获取到资料：'+(error or '词典暂无对应内容'))
+        # 卡片当前显示的是这个词时自动更新音标；不干扰卡片翻面状态。
+        if getattr(self,'card_current',None) and self.word_key(self.card_current)==key:
+            label=getattr(self,'card_ipa_label',None)
+            if label and current.get('ipa'): label.text=current['ipa']
+            if getattr(self, 'card_revealed', False) and getattr(self, 'card_detail_label', None):
+                word=self.card_current
+                self.card_detail_label.text = (
+                    f"词族：{word.get('family') or '暂无'}\n"
+                    f"例句：{current.get('example') or '暂无（可在单词详情中补充）'}\n"
+                    f"短语：{current.get('phrases') or '暂无'}"
+                )
+
+    def fetch_word_info(self, word, *_):
+        key=self.word_key(word)
+        self.word_info_fetcher.request(word.get('en',''))
+        if getattr(self,'detail_popup_key',None)==key and getattr(self,'detail_status',None):
+            self.detail_status.text='正在获取词典资料（联网查询，失败不影响现有数据）...'
+
     def show_word_details(self, word, *_):
         key = self.word_key(word)
-        details = self.load_json(self.details_path, {})
-        existing = details.get(key, {})
-        wrapper = BoxLayout(orientation='vertical',padding=dp(10),spacing=dp(8))
-        title = CNLabel(text=f"{word.get('en','')}\n{word.get('zh','')}",size_hint_y=None,height=dp(86))
-        wrapper.add_widget(title)
-        ipa = TextInput(text=existing.get('ipa',''), hint_text='音标（可手动填写）',multiline=False,size_hint_y=None,height=dp(46))
-        example = TextInput(text=existing.get('example',''), hint_text='英语例句（可手动填写）',multiline=True)
-        if CHINESE_FONT_PATH:
-            ipa.font_name = example.font_name = CHINESE_FONT_NAME
-        wrapper.add_widget(ipa)
-        wrapper.add_widget(example)
-        self._label(wrapper, f"词族/关联词：{word.get('family') or '暂无'}",height=55,size=15)
-        buttons = BoxLayout(size_hint_y=None,height=dp(48),spacing=dp(8))
-        save = CNButton(text='保存详情'); play = CNButton(text='播放发音')
-        buttons.add_widget(save); buttons.add_widget(play)
+        details = self.load_json(self.details_path,{})
+        existing = (details.get(key,{}) if isinstance(details,dict) else {})
+        if not isinstance(existing,dict): existing={}
+        wrapper=BoxLayout(orientation='vertical',padding=dp(10),spacing=dp(8))
+        heading=CNLabel(text=f"{word.get('en','')}\n{word.get('zh','')}",size_hint_y=None,height=dp(70))
+        wrapper.add_widget(heading)
+        form=ScrollView(do_scroll_x=False)
+        rows=BoxLayout(orientation='vertical',spacing=dp(8),size_hint_y=None)
+        rows.bind(minimum_height=rows.setter('height'))
+        form.add_widget(rows)
+        wrapper.add_widget(form)
+        fields=[('ipa','音标（IPA，可编辑）',48),('example','英文例句',100),
+                ('example_zh','例句中文翻译（可选）',85),('phrases','常用短语（用；分隔）',90)]
+        inputs={}
+        for field,hint,height in fields:
+            editor=TextInput(text=existing.get(field,'') or '',hint_text=hint,
+                             multiline=field!='ipa',size_hint_y=None,height=dp(height))
+            if CHINESE_FONT_PATH: editor.font_name=CHINESE_FONT_NAME
+            rows.add_widget(editor);inputs[field]=editor
+        self._label(rows,f"词族/关联词：{word.get('family') or '暂无'}",height=60,size=14)
+        self.detail_status=CNLabel(text='联网获取的资料需自行核对；手动编辑的内容优先保留。',
+                                   size_hint_y=None,height=dp(58),font_size=dp(13))
+        rows.add_widget(self.detail_status)
+        buttons=BoxLayout(size_hint_y=None,height=dp(48),spacing=dp(5))
+        download=CNButton(text='联网补充');save=CNButton(text='保存详情');play=CNButton(text='播放发音')
+        for b in (download,save,play):buttons.add_widget(b)
         wrapper.add_widget(buttons)
-        kw={"title":"单词详情", "content":wrapper,"size_hint":(.94,.75)}
-        if CHINESE_FONT_PATH:
-            kw['title_font']=CHINESE_FONT_NAME
+        kw={'title':'单词资料','content':wrapper,'size_hint':(.95,.84)}
+        if CHINESE_FONT_PATH: kw['title_font']=CHINESE_FONT_NAME
         popup=Popup(**kw)
+        self.detail_popup_key=key
+        self.detail_popup=popup
+        self.detail_inputs=inputs
+        def cleanup(*_):
+            if getattr(self,'detail_popup',None) is popup:
+                self.detail_popup=None;self.detail_popup_key=None;self.detail_inputs={}
+        popup.bind(on_dismiss=cleanup)
         def save_details(*_):
-            details[key]={"ipa":ipa.text.strip(),"example":example.text.strip()}
-            self.save_json(self.details_path, details)
+            records=self.load_json(self.details_path,{})
+            if not isinstance(records,dict):records={}
+            current=records.get(key,{})
+            if not isinstance(current,dict):current={}
+            for field,editor in inputs.items():current[field]=editor.text.strip()
+            current['source']='用户编辑'
+            records[key]=current
+            self.save_json(self.details_path,records)
             popup.dismiss()
-            self.show_popup("已保存", "音标和例句已保存到本地，并包含在数据备份中。")
+            self.show_popup('已保存','音标、例句与短语已保存，并会包含在 ZIP 数据备份中。')
         save.bind(on_release=save_details)
+        download.bind(on_release=lambda *_:self.fetch_word_info(word))
         play.bind(on_release=lambda *_:self.speak_word(word.get('en','')))
         popup.open()
+        # 只在当前资料明显缺失时自动异步查询。
+        if not existing.get('ipa') or not existing.get('example'):
+            self.fetch_word_info(word)
 
     def show_favorites(self, *_):
         keys = self._favorite_keys()
