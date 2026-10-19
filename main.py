@@ -46,6 +46,15 @@ FONT_CANDIDATES = [
 CHINESE_FONT_PATH = next((path for path in FONT_CANDIDATES if os.path.exists(path)), "")
 CHINESE_FONT_NAME = "ChineseFont"
 
+# 音标需要扩展拉丁/IPA 字形；不要强制使用中文字体。
+IPA_FONT_CANDIDATES = [
+    "/system/fonts/Roboto-Regular.ttf",
+    "/system/fonts/NotoSans-Regular.ttf",
+    "/system/fonts/NotoSansSymbols2-Regular.ttf",
+]
+IPA_FONT_PATH = next((p for p in IPA_FONT_CANDIDATES if os.path.isfile(p)), "")
+
+
 if CHINESE_FONT_PATH:
     LabelBase.register(
         name=CHINESE_FONT_NAME,
@@ -1472,6 +1481,8 @@ class VocabTrainer(BoxLayout):
         detail_map = self.load_json(self.details_path, {})
         detail = detail_map.get(self.word_key(word), {}) if isinstance(detail_map, dict) else {}
         self.card_ipa_label = self._label(pane, detail.get("ipa", "") or "音标待补充", 34, 17, align="center")
+        if IPA_FONT_PATH and detail.get("ipa"):
+            self.card_ipa_label.font_name = IPA_FONT_PATH
         if not detail.get("ipa") or not detail.get("example"):
             self.fetch_word_info(word)
         self._action(pane, "播放英文发音", lambda *_: self.speak_word(word.get("en", "")), height=48)
@@ -1624,61 +1635,125 @@ class VocabTrainer(BoxLayout):
             self.detail_status.text='正在获取词典资料（联网查询，失败不影响现有数据）...'
 
     def show_word_details(self, word, *_):
+        """词条详情：分区显示、音标独立字体，保留原有联网补充/手动保存逻辑。"""
         key = self.word_key(word)
-        details = self.load_json(self.details_path,{})
-        existing = (details.get(key,{}) if isinstance(details,dict) else {})
-        if not isinstance(existing,dict): existing={}
-        wrapper=BoxLayout(orientation='vertical',padding=dp(10),spacing=dp(8))
-        heading=CNLabel(text=f"{word.get('en','')}\n{word.get('zh','')}",size_hint_y=None,height=dp(70))
-        wrapper.add_widget(heading)
-        form=ScrollView(do_scroll_x=False)
-        rows=BoxLayout(orientation='vertical',spacing=dp(8),size_hint_y=None)
-        rows.bind(minimum_height=rows.setter('height'))
+        details = self.load_json(self.details_path, {})
+        existing = details.get(key, {}) if isinstance(details, dict) else {}
+        if not isinstance(existing, dict):
+            existing = {}
+
+        wrapper = BoxLayout(orientation="vertical", spacing=dp(9), padding=dp(12))
+        header = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(75), spacing=dp(3))
+        title = CNLabel(text=word.get("en", ""), font_size=dp(25),
+                        size_hint_y=None, height=dp(39), color=(0.96, 0.97, 1, 1))
+        subtitle = CNLabel(text=f"{word.get('pos', '')}  {word.get('zh', '')}",
+                           font_size=dp(15), size_hint_y=None, height=dp(30),
+                           color=(0.86, 0.89, 0.94, 1))
+        header.add_widget(title)
+        header.add_widget(subtitle)
+        wrapper.add_widget(header)
+
+        form = ScrollView(do_scroll_x=False, bar_width=dp(4))
+        rows = BoxLayout(orientation="vertical", spacing=dp(9),
+                         size_hint_y=None, padding=[dp(2), dp(4), dp(2), dp(10)])
+        rows.bind(minimum_height=rows.setter("height"))
         form.add_widget(rows)
         wrapper.add_widget(form)
-        fields=[('ipa','音标（IPA，可编辑）',48),('example','英文例句',100),
-                ('example_zh','例句中文翻译（可选）',85),('phrases','常用短语（用；分隔）',90)]
-        inputs={}
-        for field,hint,height in fields:
-            editor=TextInput(text=existing.get(field,'') or '',hint_text=hint,
-                             multiline=field!='ipa',size_hint_y=None,height=dp(height))
-            if CHINESE_FONT_PATH: editor.font_name=CHINESE_FONT_NAME
-            rows.add_widget(editor);inputs[field]=editor
-        self._label(rows,f"词族/关联词：{word.get('family') or '暂无'}",height=60,size=14)
-        self.detail_status=CNLabel(text='联网获取的资料需自行核对；手动编辑的内容优先保留。',
-                                   size_hint_y=None,height=dp(58),font_size=dp(13))
+
+        fields = [
+            ("ipa", "音标 IPA", 58, False),
+            ("example", "英文例句", 115, True),
+            ("example_zh", "例句中文翻译", 100, True),
+            ("phrases", "常用短语（用分号分隔）", 90, True),
+        ]
+        inputs = {}
+        for field, label_text, height, multiline in fields:
+            label = CNLabel(text=label_text, color=(0.93, 0.95, 0.98, 1),
+                            font_size=dp(15), halign="left", valign="middle",
+                            size_hint_y=None, height=dp(28))
+            label.bind(size=lambda inst, value: setattr(inst, 'text_size', value))
+            rows.add_widget(label)
+            editor = TextInput(
+                text=existing.get(field, "") or "", hint_text="暂无数据，可联网补充或手动输入",
+                multiline=multiline, size_hint_y=None, height=dp(height),
+                font_size=dp(17) if field == "ipa" else dp(16),
+                foreground_color=(0.10, 0.16, 0.23, 1),
+                background_color=(0.98, 0.99, 1, 1),
+                padding=[dp(12), dp(13), dp(12), dp(10)],
+            )
+            if field == "ipa":
+                # 系统 Roboto 提供丰富的扩展拉丁字形，避免 NotoSansSC 中音标变方框。
+                if IPA_FONT_PATH:
+                    editor.font_name = IPA_FONT_PATH
+            elif CHINESE_FONT_PATH:
+                editor.font_name = CHINESE_FONT_NAME
+            rows.add_widget(editor)
+            inputs[field] = editor
+
+        family = word.get("family") or "暂无"
+        family_label = CNLabel(
+            text=f"词族／关联词：{family}", font_size=dp(14),
+            color=(0.85, 0.89, 0.93, 1), halign="left", valign="middle",
+            size_hint_y=None, height=dp(52),
+        )
+        family_label.bind(size=lambda inst, value: setattr(inst, 'text_size',
+                            (max(1, value[0] - dp(8)), None)))
+        rows.add_widget(family_label)
+
+        self.detail_status = CNLabel(
+            text="可编辑并保存；网络资料请自行核对。",
+            font_size=dp(13), color=(0.80, 0.87, 0.92, 1),
+            halign="center", size_hint_y=None, height=dp(48),
+        )
+        self.detail_status.bind(size=lambda inst, value: setattr(inst, 'text_size',
+                                (max(1, value[0] - dp(12)), None)))
         rows.add_widget(self.detail_status)
-        buttons=BoxLayout(size_hint_y=None,height=dp(48),spacing=dp(5))
-        download=CNButton(text='联网补充');save=CNButton(text='保存详情');play=CNButton(text='播放发音')
-        for b in (download,save,play):buttons.add_widget(b)
+
+        buttons = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(7))
+        download = CNButton(text="联网补充", font_size=dp(14))
+        save = CNButton(text="保存资料", font_size=dp(14),
+                        background_color=(0.10, 0.45, 0.35, 1))
+        play = CNButton(text="播放发音", font_size=dp(14))
+        for btn in (download, save, play):
+            buttons.add_widget(btn)
         wrapper.add_widget(buttons)
-        kw={'title':'单词资料','content':wrapper,'size_hint':(.95,.84)}
-        if CHINESE_FONT_PATH: kw['title_font']=CHINESE_FONT_NAME
-        popup=Popup(**kw)
-        self.detail_popup_key=key
-        self.detail_popup=popup
-        self.detail_inputs=inputs
+        kw = {"title": "单词资料", "content": wrapper,
+              "size_hint": (0.94, 0.82), "auto_dismiss": True}
+        if CHINESE_FONT_PATH:
+            kw["title_font"] = CHINESE_FONT_NAME
+        popup = Popup(**kw)
+        self.detail_popup_key = key
+        self.detail_popup = popup
+        self.detail_inputs = inputs
+
         def cleanup(*_):
-            if getattr(self,'detail_popup',None) is popup:
-                self.detail_popup=None;self.detail_popup_key=None;self.detail_inputs={}
+            if getattr(self, "detail_popup", None) is popup:
+                self.detail_popup = None
+                self.detail_popup_key = None
+                self.detail_inputs = {}
+
         popup.bind(on_dismiss=cleanup)
+
         def save_details(*_):
-            records=self.load_json(self.details_path,{})
-            if not isinstance(records,dict):records={}
-            current=records.get(key,{})
-            if not isinstance(current,dict):current={}
-            for field,editor in inputs.items():current[field]=editor.text.strip()
-            current['source']='用户编辑'
-            records[key]=current
-            self.save_json(self.details_path,records)
+            records = self.load_json(self.details_path, {})
+            if not isinstance(records, dict):
+                records = {}
+            current = records.get(key, {})
+            if not isinstance(current, dict):
+                current = {}
+            for field, editor in inputs.items():
+                current[field] = editor.text.strip()
+            current["source"] = "用户编辑"
+            records[key] = current
+            self.save_json(self.details_path, records)
             popup.dismiss()
-            self.show_popup('已保存','音标、例句与短语已保存，并会包含在 ZIP 数据备份中。')
+            self.show_popup("已保存", "音标、例句及短语已保存到本地。")
+
         save.bind(on_release=save_details)
-        download.bind(on_release=lambda *_:self.fetch_word_info(word))
-        play.bind(on_release=lambda *_:self.speak_word(word.get('en','')))
+        download.bind(on_release=lambda *_: self.fetch_word_info(word))
+        play.bind(on_release=lambda *_: self.speak_word(word.get("en", "")))
         popup.open()
-        # 只在当前资料明显缺失时自动异步查询。
-        if not existing.get('ipa') or not existing.get('example'):
+        if not existing.get("ipa") or not existing.get("example"):
             self.fetch_word_info(word)
 
     def show_favorites(self, *_):
